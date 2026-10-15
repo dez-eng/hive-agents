@@ -141,4 +141,4 @@ v0.2 起往「A 主 + B/C/D 副」走：
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 dez-eng
