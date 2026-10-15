@@ -3,14 +3,14 @@
  *
  *   hive · deepseek-flash · 谷 · 通用 │ 本轮 $0.000043 思考32% │ 会话 $0.0012/12轮 │ 上下文 7.1k 命中92% │ 历史 $0.0056
  *
- * 默认开，但只放一行、只放最有用的五项。要看细节得敲 /cost。
+ * 默认开，但只放一行、只放最有用的几项。要看细节得敲 /cost。
  * 宽度不够时从右往左丢段，绝不换行 —— 换行会把输入行顶跑。
  */
 import { APP_NAME } from '../core/config.js';
 import type { Band } from '../core/cost.js';
 import type { LedgerTotals } from '../core/ledger.js';
 import type { SessionTally, TokenMeter } from '../core/meter.js';
-import type { AgentModule } from '../core/modules.js';
+import { agentOf, type AgentModule } from '../core/modules.js';
 import { bold, colWidth, cyan, dim, fmtPct, fmtTok, fmtUsd, visibleWidth, yellow } from './format.js';
 
 export interface FooterInput {
@@ -19,6 +19,11 @@ export interface FooterInput {
   module: AgentModule;
   thread: string;
   tail: boolean;
+  /**
+   * 模块栈（v2）。只有借调中（深 > 1）才显示 —— 平时单层没有信息量，
+   * 而这一行每一列都是抢来的。
+   */
+  stack: string[];
   lastTurn: TokenMeter | null;
   session: SessionTally;
   history: LedgerTotals | null;
@@ -67,6 +72,11 @@ function segments(f: FooterInput): string[] {
 
   if (f.history && f.history.rows) {
     out.push(`历史 ${dim(fmtUsd(f.history.costUsd))} ${dim(`${f.history.rows}行`)}`);
+  }
+
+  // 栈段排最右 —— 借调信息排在模型名之后，宽度不够时最先被丢
+  if (f.stack.length > 1) {
+    out.push(`栈 ${f.stack.map((id) => agentOf(id) ?? '?').join('›')}`);
   }
 
   return out;

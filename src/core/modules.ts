@@ -4,10 +4,13 @@
  * 一个「模块」= 一段角色片 + 工具白名单 + 思考预算。切换模块只换尾部那一段，
  * 绝不碰 system 前缀（那是缓存的命根子，见 prompt.ts）。
  *
- * v2 会把这里的每个模块接到一个副 agent（B/C/D）上；本阶段先把
- * 「换模块不炸缓存」这条机制跑通，模块本身写得朴素。
+ * v2 起每个模块挂在一个 agent（A 主 / B 侦察 / C 修复 / D 审计）名下，
+ * 见下面的 AGENTS 表：身份决定「能借调谁」，而执行层按栈顶模块收权。
  */
 export type ThinkBudget = 'off' | 'low' | 'high';
+
+/** v2 的四种身份 */
+export type AgentId = 'A' | 'B' | 'C' | 'D';
 
 export interface AgentModule {
   /** 唯一 id，命令里用 /use <id> 切 */
@@ -24,13 +27,12 @@ export interface AgentModule {
   /** 该模块可用的工具名，空数组 = 不给工具 */
   tools: string[];
   /**
-   * 思考预算。DeepSeek 那侧的开关还没验证出结论（阶段 6.7 的
-   * /thinktest 悬着），本阶段只记录意向、不强行施加，免得两条变量
-   * 混在一起，账本读不出来。
+   * 思考预算。DeepSeek 那侧的开关还没验证出结论（/thinktest 在 M1 落地），
+   * 本阶段只记录意向、不强行施加，免得两条变量混在一起，账本读不出来。
    */
   think: ThinkBudget;
-  /** 预留：v2 里这个模块属于哪个副 agent（A 主 / B 侦察 / C 修复 / D 审计） */
-  owner?: 'A' | 'B' | 'C' | 'D';
+  /** 这个模块属于哪个 agent（A 主 / B 侦察 / C 修复 / D 审计） */
+  owner?: AgentId;
 }
 
 export const MODULES: Record<string, AgentModule> = {
@@ -62,6 +64,17 @@ export const MODULES: Record<string, AgentModule> = {
     think: 'high',
     owner: 'B',
   },
+  fix: {
+    id: 'fix',
+    title: '修复',
+    summary: '按给定目标与差异改文件，不扩大范围（v2 给 C agent）',
+    fragment: '当前是修复角色：只按给定的目标与差异改文件，不顺手重构、不扩大范围。',
+    // M1 零新工具（工具 schema 属缓存前缀，改动要一次加齐）。
+    // write_file 与 delegate 在 M2 一起进 ALL_TOOLS —— 那时前缀只作废一次。
+    tools: ['read_file'],
+    think: 'low',
+    owner: 'C',
+  },
   audit: {
     id: 'audit',
     title: '审计',
@@ -74,7 +87,55 @@ export const MODULES: Record<string, AgentModule> = {
   },
 };
 
+/**
+ * 身份表 —— v2 的授权地基。
+ *
+ * `mayCall` 是「谁可以向谁借调」的唯一真相；执行层（M2 的 delegate 入口）
+ * 按它 + 令牌一起挡。写在数据里而不是提示词里，模型看不到也绕不过。
+ */
+export interface AgentSpec {
+  id: AgentId;
+  title: string;
+  /** 该 agent 的主模块 —— `/as <agent>` 压栈的就是它 */
+  home: string;
+  /** 可借调的副 agent，空数组 = 只能自己干 */
+  mayCall: AgentId[];
+  summary: string;
+}
+
+export const AGENTS: Record<AgentId, AgentSpec> = {
+  A: {
+    id: 'A',
+    title: '主控',
+    home: 'assistant',
+    mayCall: ['B', 'C', 'D'],
+    summary: '持会话与工作记忆，定分工、发令牌、做精简再分配',
+  },
+  B: {
+    id: 'B',
+    title: '侦察',
+    home: 'recon',
+    mayCall: ['C', 'D'],
+    summary: '只收集事实；需要动手时向 A 领令牌再借调 C/D',
+  },
+  C: {
+    id: 'C',
+    title: '修复',
+    home: 'fix',
+    mayCall: [],
+    summary: '按给定目标与差异改文件，不扩大范围',
+  },
+  D: {
+    id: 'D',
+    title: '审计',
+    home: 'audit',
+    mayCall: [],
+    summary: '复核结论与原始事实是否一致',
+  },
+};
+
 export const DEFAULT_MODULE = 'assistant';
+export const DEFAULT_AGENT: AgentId = 'A';
 
 export function getModule(id: string): AgentModule | undefined {
   return MODULES[id];
@@ -82,6 +143,20 @@ export function getModule(id: string): AgentModule | undefined {
 
 export function moduleList(): AgentModule[] {
   return Object.values(MODULES);
+}
+
+export function getAgent(id: string): AgentSpec | undefined {
+  return AGENTS[id as AgentId];
+}
+
+/** 模块 → 归属 agent。没写 owner 的老模块按 A 算 */
+export function agentOf(moduleId: string): AgentId | undefined {
+  return MODULES[moduleId]?.owner ?? (MODULES[moduleId] ? DEFAULT_AGENT : undefined);
+}
+
+/** 该身份能不能借调目标身份 —— 执行层授权检查的第一道（第二道是令牌） */
+export function mayDelegate(from: AgentId, to: AgentId): boolean {
+  return AGENTS[from].mayCall.includes(to);
 }
 
 /** 尾巴那一段 —— 固定格式，便于人去认，也便于模型识别 */

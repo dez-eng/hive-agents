@@ -9,9 +9,17 @@ import { priceFor } from './core/cost.js';
 import type { HiveAgent } from './core/agent.js';
 import { Ledger, head, missOf, type LedgerRow } from './core/ledger.js';
 import { SessionTally, type TokenMeter } from './core/meter.js';
-import { getModule, moduleList } from './core/modules.js';
+import {
+  AGENTS,
+  DEFAULT_MODULE,
+  getAgent,
+  getModule,
+  moduleList,
+} from './core/modules.js';
 import { STABLE_PREFIX, TAIL_MARK } from './core/prompt.js';
-import type { ReplState } from './core/session.js';
+import { currentAgent, currentModuleId, type ReplState } from './core/session.js';
+import { stackDepth, stackPop, stackPush } from './core/stack.js';
+import { THINK_CANDIDATES, pickThinkingOff, runThinkProbe, thinkVerdict } from './core/think.js';
 import { ALL_TOOLS, ROOT, toolsChars } from './core/tools.js';
 import { bold, dim, fmtInt, fmtPct, fmtTok, fmtUsd, green, red, yellow } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
@@ -296,24 +304,94 @@ export const COMMANDS: Command[] = [
     usage: '/modules',
     summary: '列模块（角色片挂 prompt 尾部，切它不动前缀缓存）',
     async run(ctx) {
-      ctx.out(bold(`[模块 · 当前 ${ctx.state.moduleId} · 尾部角色片 ${ctx.state.tail ? '开' : '关'}]`));
+      const cur = currentModuleId(ctx.state);
+      ctx.out(
+        bold(
+          `[模块 · 当前 ${cur}（身份 ${currentAgent(ctx.state)}） · 尾部角色片 ${ctx.state.tail ? '开' : '关'}]`,
+        ),
+      );
       for (const m of moduleList()) {
-        const mark = m.id === ctx.state.moduleId ? green('▸') : ' ';
+        const mark = m.id === cur ? green('▸') : ' ';
         ctx.out(
           `${mark} ${m.id.padEnd(10)} ${m.title.padEnd(4)} ${dim(m.summary)}` +
             `  ${dim(`[工具 ${m.tools.join(',') || '无'} · 思考 ${m.think}${m.owner ? ` · 归属 ${m.owner}` : ''}]`)}`,
         );
       }
       ctx.out();
-      ctx.out(dim('  /use <id> 切模块 —— 只换用户消息尾部那一段，system 前缀与历史都不动。'));
+      ctx.out(dim('  /use <id> 切模块（压栈）· /pop 弹回上一层 · /stack 看整条栈 · /as 切身份'));
       ctx.out();
+    },
+  },
+
+  {
+    name: '/stack',
+    usage: '/stack',
+    summary: '模块栈：栈底是主控，栈顶是当前执行者（借调结束弹回）',
+    async run(ctx) {
+      const s = ctx.state.stack;
+      ctx.out(
+        bold(
+          `[模块栈 · 深 ${stackDepth(s)} · 当前 ${currentModuleId(ctx.state)}（身份 ${currentAgent(ctx.state)}）]`,
+        ),
+      );
+      s.forEach((id, i) => {
+        const m = getModule(id);
+        const isTop = i === s.length - 1;
+        const spec = getAgent(m?.owner ?? 'A');
+        ctx.out(
+          `  ${isTop ? green('▸') : ' '} ${String(i).padStart(2)}  ${id.padEnd(10)}` +
+            ` ${(m?.title ?? '?').padEnd(4)} ${dim(`${spec?.title ?? '?'}(${spec?.id ?? '?'})`)}` +
+            (isTop ? dim('   ← 栈顶，prompt 尾部挂它') : ''),
+        );
+      });
+      ctx.out();
+      ctx.out(dim('  栈底永不弹出；/pop 弹一层 = 借调结束回到原角色。'));
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/pop',
+    usage: '/pop',
+    summary: '弹一层栈（借调结束，回到原角色）',
+    async run(ctx) {
+      if (stackDepth(ctx.state.stack) <= 1) {
+        ctx.out(dim('[栈只有一层（主控），没有可弹回的上一层]\n'));
+        return;
+      }
+      const was = currentModuleId(ctx.state);
+      ctx.state.stack = stackPop(ctx.state.stack);
+      const now = currentModuleId(ctx.state);
+      ctx.out(`[已弹回 ${now}｜${getModule(now)?.title ?? ''}（上一层是 ${was}）]`);
+      ctx.out(dim(`  尾部角色片：${getModule(now)?.fragment ?? ''}\n`));
+    },
+  },
+
+  {
+    name: '/as',
+    usage: '/as A|B|C|D',
+    summary: '切身份（压入该 agent 的主模块）—— 调试 / 演示用',
+    async run(ctx, args) {
+      const id = (args[0] ?? '').trim().toUpperCase();
+      const spec = getAgent(id);
+      if (!spec) {
+        ctx.out(red(`[没有身份 ${id || '(空)'} · 可选 ${Object.keys(AGENTS).join('/')}]\n`));
+        return;
+      }
+      if (spec.home === currentModuleId(ctx.state)) {
+        ctx.out(dim(`[已经是 ${spec.id}（${spec.home}）了，没压栈]\n`));
+        return;
+      }
+      ctx.state.stack = stackPush(ctx.state.stack, spec.home);
+      ctx.out(`[身份 ${spec.id}｜${spec.title} → 压入模块 ${spec.home}（栈深 ${stackDepth(ctx.state.stack)}）]`);
+      ctx.out(dim(`  可借调：${spec.mayCall.length ? spec.mayCall.join('/') : '（无）'}\n`));
     },
   },
 
   {
     name: '/use',
     usage: '/use <id>',
-    summary: '切模块',
+    summary: '切模块（压栈；/pop 弹回上一层）',
     async run(ctx, args) {
       const id = (args[0] ?? '').trim();
       const m = getModule(id);
@@ -321,10 +399,15 @@ export const COMMANDS: Command[] = [
         ctx.out(red(`[没有模块 ${id || '(空)'} · 敲 /modules 看可用的]\n`));
         return;
       }
-      ctx.state.moduleId = m.id;
-      ctx.out(`[已切到 ${m.id}｜${m.title}]`);
+      if (id === currentModuleId(ctx.state)) {
+        ctx.out(dim(`[已经在 ${id} 了，没压栈]\n`));
+        return;
+      }
+      ctx.state.stack = stackPush(ctx.state.stack, m.id);
+      ctx.out(`[已切到 ${m.id}｜${m.title}（栈深 ${stackDepth(ctx.state.stack)}）]`);
       ctx.out(dim(`  尾部角色片：${m.fragment}`));
-      ctx.out(dim('  前缀缓存不受影响 —— system 与历史一个字节都没动。\n'));
+      ctx.out(dim('  前缀缓存不受影响 —— system 与历史一个字节都没动。'));
+      ctx.out(dim('  要回到上一层就 /pop。\n'));
     },
   },
 
@@ -374,7 +457,9 @@ export const COMMANDS: Command[] = [
     async run(ctx) {
       const thread = Math.random().toString(16).slice(2, 10);
       ctx.state.thread = thread;
-      ctx.out(`[已开新会话 thread_id=${thread}]`);
+      // 新会话 = 冷缓存；模块栈也一并回到主控 —— 借调状态不该跨会话残留
+      ctx.state.stack = [DEFAULT_MODULE];
+      ctx.out(`[已开新会话 thread_id=${thread} · 模块栈已回到 ${DEFAULT_MODULE}]`);
       ctx.out(dim('  冷缓存：下一轮整段 prompt 都要按全价未命中付一次。'));
       ctx.out(dim('  好处是历史清空，风格与模块的影响变干净。\n'));
     },
@@ -407,7 +492,7 @@ export const COMMANDS: Command[] = [
       const huChars = hu.reduce((n, m) => n + String(m.content).length, 0);
       const toolChars = toolsChars();
       const tailChars = ctx.state.tail
-        ? hu.length * (TAIL_MARK.length + moduleOf(ctx.state.moduleId).fragment.length + 8)
+        ? hu.length * (TAIL_MARK.length + moduleOf(currentModuleId(ctx.state)).fragment.length + 8)
         : 0;
       const total = STABLE_PREFIX.length + toolChars + aiChars + huChars;
       ctx.out(bold(`[Prompt 解剖 · thread=${ctx.state.thread} · 未含服务端模板开销]`));
@@ -601,6 +686,66 @@ export const COMMANDS: Command[] = [
   },
 
   {
+    name: '/thinktest',
+    usage: '/thinktest [问题]',
+    summary: '探思考开关：同题多跑几组参数，看哪组把思考打到 0',
+    hidden: true,
+    async run(ctx, args) {
+      const question = args.join(' ').trim() || '1+1 等于几？只回数字，不要解释。';
+      ctx.out(bold(`[thinktest · 模型 ${ctx.agent.modelId} · ${THINK_CANDIDATES.length} 组候选]`));
+      ctx.out(dim(`  探针问题：${question}`));
+      ctx.out(dim('  每组一次真调用 —— 会花钱，但这是唯一能把开关量出来的办法。'));
+      if (!hasApiKey()) {
+        ctx.out();
+        ctx.out(red('[没设 DEEPSEEK_API_KEY —— 跑不了，先把候选表列给你]'));
+        for (const c of THINK_CANDIDATES) {
+          ctx.out(`    ${c.label.padEnd(26)} ${dim(c.why)}`);
+        }
+        ctx.out();
+        return;
+      }
+      ctx.out();
+      const samples = await runThinkProbe({ model: ctx.agent.modelId, question });
+      for (const s of samples) {
+        if (!s.ok) {
+          ctx.out(`  ${s.label.padEnd(26)} ${red('失败')} ${dim(s.error ?? '')}`);
+          continue;
+        }
+        ctx.out(
+          `  ${s.label.padEnd(26)} 思考 ${String(s.reasonTok).padStart(6)}` +
+            ` · 出 ${String(s.outTok).padStart(5)} · 入 ${String(s.inTok).padStart(6)}` +
+            ` · ${fmtUsd(s.costUsd)}`,
+        );
+      }
+      ctx.out();
+      const off = pickThinkingOff(samples);
+      ctx.out(green(`  → ${thinkVerdict(samples)}`));
+      if (off) {
+        const kw = THINK_CANDIDATES.find((c) => c.label === off.label)?.kwargs ?? {};
+        ctx.out(dim(`     对应的请求字段：${JSON.stringify(kw)}`));
+      }
+      ctx.out(dim('  逐组落账（tag=thinktest）—— 之后按任务分级给模块配思考预算。'));
+      for (const s of samples) {
+        ctx.ledger.insert({
+          kind: 'thinktest',
+          threadId: ctx.state.thread,
+          module: currentModuleId(ctx.state),
+          calls: s.ok ? 1 : 0,
+          inTok: s.inTok,
+          cacheHit: 0,
+          outTok: s.outTok,
+          reasoning: s.reasonTok,
+          costUsd: s.costUsd,
+          userChars: question.length,
+          userHead: s.label,
+          outHead: s.ok ? 'ok' : s.error ?? '',
+        });
+      }
+      ctx.out();
+    },
+  },
+
+  {
     name: '/doctor',
     usage: '/doctor',
     summary: '环境自检（账本、sqlite、key、计量字段校准）',
@@ -667,9 +812,10 @@ export function footerInput(ctx: Ctx) {
   return {
     model: ctx.agent.modelId,
     band: currentBand(),
-    module: moduleOf(ctx.state.moduleId),
+    module: moduleOf(currentModuleId(ctx.state)),
     thread: ctx.state.thread,
     tail: ctx.state.tail,
+    stack: ctx.state.stack,
     lastTurn: ctx.state.lastTurn,
     session: ctx.session,
     history: ctx.ledger.totals(),

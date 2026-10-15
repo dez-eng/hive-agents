@@ -1,10 +1,15 @@
 /**
  * 账本。用 Node 内置的 node:sqlite（零外部依赖），表结构与阶段 6.7 的
- * costs.db 对齐 —— 除了新增一列 module，其余列名一字不改，所以本工具
+ * costs.db 对齐 —— 除了新增几列，其余列名一字不改，所以本工具
  * 能直接读你 Python 版留下的历史账。
  *
  * 加载 node:sqlite 之前要先调 silenceSqliteWarning()，所以这里用
  * createRequire 延迟加载，而不是顶部 import。
+ *
+ * v2 扩了四列（agent / task_id / budget_tok / budget_hit）外加两张表：
+ *   tokens   —— 授权令牌（谁能借调谁、有多少预算、什么时候过期）
+ *   handoffs —— 交接记录（谁把什么交给了谁、花了多少）
+ * 老库靠 ALTER TABLE 补列，旧行照读，sqlite 的 ADD COLUMN 是 O(1)。
  */
 import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
@@ -12,6 +17,7 @@ import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { BLOCK, ledgerPath, modelName } from './config.js';
+import type { Token } from './grant.js';
 
 const requireNative = createRequire(import.meta.url);
 
@@ -48,6 +54,14 @@ export interface LedgerEntry {
   model?: string;
   band?: string;
   runId?: string;
+  /** v2：这一轮是谁在干（A 主 / B 侦察 / C 修复 / D 审计） */
+  agent?: string;
+  /** v2：子任务 id —— 借调产生的那几轮带它，便于对账 */
+  taskId?: string;
+  /** v2：子任务的预算闸门（token） */
+  budgetTok?: number;
+  /** v2：这一轮是否被预算闸门熔断（1 = 是） */
+  budgetHit?: number;
 }
 
 export interface LedgerRow {
@@ -70,6 +84,10 @@ export interface LedgerRow {
   userHead: string;
   outHead: string;
   styleOn: number;
+  agent: string;
+  taskId: string;
+  budgetTok: number;
+  budgetHit: number;
 }
 
 export interface LedgerTotals {
@@ -80,6 +98,24 @@ export interface LedgerTotals {
   reasoning: number;
   costUsd: number;
   rows: number;
+}
+
+/** 一次交接的记录 —— 交接走 schema，落库也只落结构化字段 */
+export interface HandoffRecord {
+  id?: number;
+  ts?: string;
+  taskId: string;
+  from: string;
+  to: string;
+  goal: string;
+  expect: string;
+  budgetTok: number;
+  tokens: number;
+  costUsd: number;
+  ok: boolean;
+  budgetHit: boolean;
+  notes?: string;
+  output?: string;
 }
 
 /** 整段压成一行，取前 n 字 —— 用来在账本里认出「这轮问了什么、答了什么」 */
@@ -98,6 +134,10 @@ function num(v: unknown): number {
 
 function str(v: unknown): string {
   return v === undefined || v === null ? '' : String(v);
+}
+
+function bool(v: unknown): boolean {
+  return num(v) !== 0;
 }
 
 function mapRow(r: Record<string, unknown>): LedgerRow {
@@ -121,12 +161,17 @@ function mapRow(r: Record<string, unknown>): LedgerRow {
     userHead: str(r['user_head']),
     outHead: str(r['out_head']),
     styleOn: Number.isFinite(Number(r['style_on'])) ? Number(r['style_on']) : -1,
+    agent: str(r['agent']),
+    taskId: str(r['task_id']),
+    budgetTok: num(r['budget_tok']),
+    budgetHit: num(r['budget_hit']),
   };
 }
 
 const COLUMNS =
   'id, ts, day, run_id, thread_id, model, band, tag, module, calls, in_tok, cache_hit,' +
-  ' out_tok, reason_tok, cost_usd, user_chars, user_head, out_head, style_on';
+  ' out_tok, reason_tok, cost_usd, user_chars, user_head, out_head, style_on,' +
+  ' agent, task_id, budget_tok, budget_hit';
 
 /** 未命中 = 入 − 命中；余额 = 未命中 − (入 mod 64)；k = 余额 ÷ 64 */
 export function kBlocksOf(inTok: number, cacheHit: number): number {
@@ -137,6 +182,28 @@ export function kBlocksOf(inTok: number, cacheHit: number): number {
 
 export function missOf(inTok: number, cacheHit: number): number {
   return Math.max(inTok - cacheHit, 0);
+}
+
+function tokenFromRow(r: Record<string, unknown>): Token {
+  let mayCall: Token['mayCall'] = [];
+  try {
+    const parsed: unknown = JSON.parse(str(r['may_call']) || '[]');
+    if (Array.isArray(parsed)) mayCall = parsed as Token['mayCall'];
+  } catch {
+    /* 坏了就当空 —— 空 mayCall 等于什么都借不动，安全侧 */
+  }
+  const t: Token = {
+    id: str(r['id']),
+    issuedBy: str(r['issued_by']) as Token['issuedBy'],
+    to: str(r['to_agent']) as Token['to'],
+    mayCall,
+    budgetTokens: num(r['budget_tok']),
+    issuedAt: num(r['issued_at']),
+    expiresAt: num(r['expires_at']),
+    spent: num(r['spent']),
+  };
+  const note = str(r['note']);
+  return note ? { ...t, note } : t;
 }
 
 export class Ledger {
@@ -180,11 +247,15 @@ export class Ledger {
           user_head  TEXT    NOT NULL DEFAULT '',
           out_head   TEXT    NOT NULL DEFAULT '',
           cost_usd   REAL    NOT NULL,
-          style_on   INTEGER NOT NULL DEFAULT -1
+          style_on   INTEGER NOT NULL DEFAULT -1,
+          agent      TEXT    NOT NULL DEFAULT '',
+          task_id    TEXT    NOT NULL DEFAULT '',
+          budget_tok INTEGER NOT NULL DEFAULT 0,
+          budget_hit INTEGER NOT NULL DEFAULT 0
         )
       `);
 
-      // 老库（6.5~6.7 写的）补列
+      // 老库（6.5~6.7 写的，以及 v0.1 的 hive）补列
       const cols = new Set(
         db.prepare('PRAGMA table_info(ledger)').all().map((r) => str(r['name'])),
       );
@@ -195,6 +266,10 @@ export class Ledger {
         ['out_head', "ALTER TABLE ledger ADD COLUMN out_head TEXT NOT NULL DEFAULT ''"],
         ['style_on', 'ALTER TABLE ledger ADD COLUMN style_on INTEGER NOT NULL DEFAULT -1'],
         ['module', "ALTER TABLE ledger ADD COLUMN module TEXT NOT NULL DEFAULT ''"],
+        ['agent', "ALTER TABLE ledger ADD COLUMN agent TEXT NOT NULL DEFAULT ''"],
+        ['task_id', "ALTER TABLE ledger ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"],
+        ['budget_tok', 'ALTER TABLE ledger ADD COLUMN budget_tok INTEGER NOT NULL DEFAULT 0'],
+        ['budget_hit', 'ALTER TABLE ledger ADD COLUMN budget_hit INTEGER NOT NULL DEFAULT 0'],
       ];
       for (const [col, ddl] of patches) {
         if (!cols.has(col)) db.exec(ddl);
@@ -203,6 +278,44 @@ export class Ledger {
       db.exec('CREATE INDEX IF NOT EXISTS idx_run ON ledger(run_id)');
       db.exec('CREATE INDEX IF NOT EXISTS idx_tag ON ledger(tag)');
       db.exec('CREATE INDEX IF NOT EXISTS idx_thread ON ledger(thread_id)');
+
+      // v2：授权令牌
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tokens (
+          id         TEXT    PRIMARY KEY,
+          issued_by  TEXT    NOT NULL,
+          to_agent   TEXT    NOT NULL,
+          may_call   TEXT    NOT NULL DEFAULT '[]',
+          budget_tok INTEGER NOT NULL DEFAULT 0,
+          issued_at  INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          spent      INTEGER NOT NULL DEFAULT 0,
+          note       TEXT    NOT NULL DEFAULT ''
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_tok_to ON tokens(to_agent)');
+
+      // v2：交接记录（谁把什么交给了谁、花了多少）
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS handoffs (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id     TEXT    NOT NULL,
+          ts          TEXT    NOT NULL,
+          day         TEXT    NOT NULL,
+          from_agent  TEXT    NOT NULL,
+          to_agent    TEXT    NOT NULL,
+          goal        TEXT    NOT NULL DEFAULT '',
+          expect      TEXT    NOT NULL DEFAULT '',
+          budget_tok  INTEGER NOT NULL DEFAULT 0,
+          tokens      INTEGER NOT NULL DEFAULT 0,
+          cost_usd    REAL    NOT NULL DEFAULT 0,
+          ok          INTEGER NOT NULL DEFAULT 1,
+          budget_hit  INTEGER NOT NULL DEFAULT 0,
+          notes       TEXT    NOT NULL DEFAULT '',
+          output_head TEXT    NOT NULL DEFAULT ''
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_ho_task ON handoffs(task_id)');
 
       this.db = db;
       return true;
@@ -228,8 +341,8 @@ export class Ledger {
       const stmt = this.db.prepare(
         'INSERT INTO ledger (ts, day, run_id, thread_id, model, band, tag, module,' +
           ' calls, in_tok, cache_hit, out_tok, reason_tok, user_chars, user_head,' +
-          ' out_head, cost_usd, style_on)' +
-          ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          ' out_head, cost_usd, style_on, agent, task_id, budget_tok, budget_hit)' +
+          ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       );
       const res = stmt.run(
         at.toISOString().slice(0, 19),
@@ -250,6 +363,10 @@ export class Ledger {
         head(e.outHead),
         e.costUsd,
         e.styleOn ?? -1,
+        e.agent ?? '',
+        e.taskId ?? '',
+        e.budgetTok ?? 0,
+        e.budgetHit ?? 0,
       );
       const id = res.lastInsertRowid;
       return typeof id === 'number' ? id : null;
@@ -328,6 +445,19 @@ export class Ledger {
     }
   }
 
+  /** 某个子任务（借调）的逐轮 */
+  turnsOfTask(taskId: string): LedgerRow[] {
+    if (!this.db) return [];
+    try {
+      return this.db
+        .prepare(`SELECT ${COLUMNS} FROM ledger WHERE task_id=? ORDER BY id ASC`)
+        .all(taskId)
+        .map(mapRow);
+    } catch {
+      return [];
+    }
+  }
+
   totals(scope: { day?: string; runId?: string; threadId?: string } = {}): LedgerTotals | null {
     if (!this.db) return null;
     try {
@@ -399,6 +529,150 @@ export class Ledger {
       const r = this.db.prepare('SELECT MIN(ts) AS ts FROM ledger').get();
       const v = str(r?.['ts']);
       return v || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ── v2：令牌 ─────────────────────────────────────────────
+
+  saveToken(t: Token): boolean {
+    if (!this.db) return false;
+    try {
+      this.db
+        .prepare(
+          'INSERT OR REPLACE INTO tokens (id, issued_by, to_agent, may_call, budget_tok,' +
+            ' issued_at, expires_at, spent, note) VALUES (?,?,?,?,?,?,?,?,?)',
+        )
+        .run(
+          t.id,
+          t.issuedBy,
+          t.to,
+          JSON.stringify(t.mayCall),
+          t.budgetTokens,
+          t.issuedAt,
+          t.expiresAt,
+          t.spent,
+          t.note ?? '',
+        );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  loadToken(id: string): Token | null {
+    if (!this.db) return null;
+    try {
+      const r = this.db.prepare('SELECT * FROM tokens WHERE id=?').get(id);
+      return r ? tokenFromRow(r) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 手上还有效的令牌（未过期，可选按持有人过滤）—— 按签发时间新的在前 */
+  liveTokens(to?: string, now = Date.now()): Token[] {
+    if (!this.db) return [];
+    try {
+      const rows = to
+        ? this.db
+            .prepare('SELECT * FROM tokens WHERE to_agent=? AND expires_at>=? ORDER BY issued_at DESC')
+            .all(to, now)
+        : this.db
+            .prepare('SELECT * FROM tokens WHERE expires_at>=? ORDER BY issued_at DESC')
+            .all(now);
+      return rows.map(tokenFromRow);
+    } catch {
+      return [];
+    }
+  }
+
+  /** 记一笔消耗（按 id 覆盖 spent） */
+  updateTokenSpent(id: string, spent: number): boolean {
+    if (!this.db) return false;
+    try {
+      this.db.prepare('UPDATE tokens SET spent=? WHERE id=?').run(Math.trunc(spent), id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ── v2：交接记录 ──────────────────────────────────────────
+
+  insertHandoff(h: HandoffRecord): number | null {
+    if (!this.db) return null;
+    try {
+      const at = new Date();
+      const res = this.db
+        .prepare(
+          'INSERT INTO handoffs (task_id, ts, day, from_agent, to_agent, goal, expect,' +
+            ' budget_tok, tokens, cost_usd, ok, budget_hit, notes, output_head)' +
+            ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        )
+        .run(
+          h.taskId,
+          at.toISOString().slice(0, 19),
+          at.toISOString().slice(0, 10),
+          h.from,
+          h.to,
+          head(h.goal, 80),
+          head(h.expect, 80),
+          h.budgetTok,
+          h.tokens,
+          h.costUsd,
+          h.ok ? 1 : 0,
+          h.budgetHit ? 1 : 0,
+          h.notes ?? '',
+          head(h.output, 80),
+        );
+      const id = res.lastInsertRowid;
+      return typeof id === 'number' ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  recentHandoffs(limit = 10): HandoffRecord[] {
+    if (!this.db) return [];
+    try {
+      return this.db
+        .prepare('SELECT * FROM handoffs ORDER BY id DESC LIMIT ?')
+        .all(limit)
+        .map((r) => ({
+          id: num(r['id']),
+          ts: str(r['ts']),
+          taskId: str(r['task_id']),
+          from: str(r['from_agent']),
+          to: str(r['to_agent']),
+          goal: str(r['goal']),
+          expect: str(r['expect']),
+          budgetTok: num(r['budget_tok']),
+          tokens: num(r['tokens']),
+          costUsd: num(r['cost_usd']),
+          ok: bool(r['ok']),
+          budgetHit: bool(r['budget_hit']),
+          notes: str(r['notes']),
+          output: str(r['output_head']),
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** 一次借调花了多少（按 task 汇总） */
+  handoffTotals(taskId: string): { tokens: number; costUsd: number; rows: number } | null {
+    if (!this.db) return null;
+    try {
+      const r = this.db
+        .prepare(
+          'SELECT COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(cost_usd),0) AS cost_usd,' +
+            ' COUNT(*) AS rows FROM handoffs WHERE task_id=?',
+        )
+        .get(taskId);
+      if (!r) return null;
+      return { tokens: num(r['tokens']), costUsd: num(r['cost_usd']), rows: num(r['rows']) };
     } catch {
       return null;
     }

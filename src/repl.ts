@@ -11,7 +11,7 @@ import { HiveAgent, type HiveAgent as AgentType } from './core/agent.js';
 import { Ledger } from './core/ledger.js';
 import { SessionTally } from './core/meter.js';
 import { getModule } from './core/modules.js';
-import { newReplState, type ReplState } from './core/session.js';
+import { currentModuleId, newReplState, type ReplState } from './core/session.js';
 import { findCommand, footerInput, knownCommandNames, type Ctx } from './commands.js';
 import { bold, cyan, dim, fmtUsd, gray, red } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
@@ -68,7 +68,7 @@ function banner(ctx: Ctx): void {
   );
   ctx.out(
     dim(
-      `checkpoint ${memoryPath()} · 模块 ${ctx.state.moduleId}` +
+      `checkpoint ${memoryPath()} · 模块 ${currentModuleId(ctx.state)}` +
         (ctx.state.tail ? ' · 尾部角色片 开' : ' · 尾部角色片 关'),
     ),
   );
@@ -78,7 +78,8 @@ function banner(ctx: Ctx): void {
 
 /** 一轮真实对话 —— 流式打印、记账、补 footer */
 export async function runTurn(ctx: Ctx, text: string): Promise<void> {
-  const mod = getModule(ctx.state.moduleId) ?? getModule('assistant')!;
+  // 当前角色 = 栈顶模块。借调中就是被借调的那个 agent
+  const mod = getModule(currentModuleId(ctx.state)) ?? getModule('assistant')!;
   process.stdout.write(`\n${bold('助手')} ${dim('>')} `);
 
   let answer = '';
