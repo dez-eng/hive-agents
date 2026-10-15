@@ -20,6 +20,9 @@ import { STABLE_PREFIX, TAIL_MARK } from './core/prompt.js';
 import { currentAgent, currentModuleId, type ReplState } from './core/session.js';
 import { stackDepth, stackPop, stackPush } from './core/stack.js';
 import { THINK_CANDIDATES, pickThinkingOff, runThinkProbe, thinkVerdict } from './core/think.js';
+import { issueToken, remaining } from './core/grant.js';
+import { makeTaskId, type HandoffInput } from './core/handoff.js';
+import { runSubagent } from './core/subagent.js';
 import { ALL_TOOLS, ROOT, toolsChars } from './core/tools.js';
 import { bold, dim, fmtInt, fmtPct, fmtTok, fmtUsd, green, red, yellow } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
@@ -681,6 +684,148 @@ export const COMMANDS: Command[] = [
       }
       ctx.out();
       ctx.out(dim('  逐轮看 /turn   搜词看 /find   几何律看 /misscheck'));
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/grant',
+    usage: '/grant <B|C|D> <预算>',
+    summary: '主控签发借调令牌（默认自动签发之外的收紧手段）',
+    async run(ctx, args) {
+      const to = (args[0] ?? '').trim().toUpperCase();
+      const spec = getAgent(to);
+      if (!spec || to === 'A') {
+        ctx.out(red(`[签给谁？可选 ${Object.keys(AGENTS).filter((a) => a !== 'A').join('/')}]\n`));
+        return;
+      }
+      const budget = Number(args[1]);
+      if (!Number.isFinite(budget) || budget < 0) {
+        ctx.out(red('[预算写个非负整数 token，例如 /grant B 5000]\n'));
+        return;
+      }
+      const note = args.slice(2).join(' ').trim();
+      const r = issueToken(spec.id, { budgetTokens: budget, ...(note ? { note } : {}) });
+      if (!r.ok) {
+        ctx.out(red(`[签发失败：${r.reason}]\n`));
+        return;
+      }
+      ctx.ledger.saveToken(r.token);
+      ctx.out(
+        green(
+          `[已签发 → ${spec.id}｜${spec.title}｜预算 ${fmtInt(r.token.budgetTokens)} token｜可借调 ${r.token.mayCall.join('/') || '（无）'}]`,
+        ),
+      );
+      ctx.out(dim(`  有效期至 ${new Date(r.token.expiresAt).toLocaleString()}｜id ${r.token.id}`));
+      ctx.out(dim('  默认由 A 自动签发；/grant 用于手动签发或收紧授权。\n'));
+    },
+  },
+
+  {
+    name: '/handoffs',
+    usage: '/handoffs [n]',
+    summary: '交接记录：谁把什么交给了谁、花了多少',
+    async run(ctx, args) {
+      const n = Number(args[0]) || 10;
+      const rows = ctx.ledger.recentHandoffs(n);
+      if (!rows.length) {
+        ctx.out(dim('[还没有交接记录]\n'));
+        return;
+      }
+      ctx.out(bold(`[最近 ${rows.length} 条交接 · 新的在前]`));
+      for (const h of rows) {
+        const flag = h.budgetHit ? red('熔断') : h.ok ? green('完成') : red('失败');
+        ctx.out(
+          `  ${(h.ts ?? '').slice(5, 19)}  ${h.from}→${h.to}  ${flag}  ${fmtInt(h.tokens)} token` +
+            `  ${fmtUsd(h.costUsd)}  ${h.taskId}`,
+        );
+        ctx.out(dim(`      目标「${h.goal}」${h.notes ? ` · ${h.notes}` : ''}`));
+      }
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/budget',
+    usage: '/budget',
+    summary: '本会话的令牌与预算余额',
+    async run(ctx) {
+      const me = currentAgent(ctx.state);
+      const all = ctx.ledger.liveTokens();
+      ctx.out(bold(`[预算 · 当前身份 ${me}｜有效令牌 ${all.length} 张]`));
+      if (!all.length) {
+        ctx.out(dim('  （没有有效令牌）'));
+        ctx.out(dim('  A 借调时自动签发；也可手动 /grant <身份> <预算>。\n'));
+        return;
+      }
+      for (const t of all) {
+        const rem = Math.max(t.budgetTokens - t.spent, 0);
+        const mine = t.to === me ? green(' ← 本人') : '';
+        ctx.out(
+          `  ${t.to}  ${fmtInt(t.spent)}/${fmtInt(t.budgetTokens)} 用掉 · 余 ${fmtInt(rem)}` +
+            `  可借调 ${t.mayCall.join('/') || '（无）'}${mine}`,
+        );
+        ctx.out(dim(`      id ${t.id}｜至 ${new Date(t.expiresAt).toLocaleString()}${t.note ? `｜${t.note}` : ''}`));
+      }
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/delegate',
+    usage: '/delegate <A|B|C|D> <目标>',
+    summary: '把任务交给另一个身份（走令牌 + 预算闸门 + 独立 thread）',
+    async run(ctx, args) {
+      const to = (args[0] ?? '').trim().toUpperCase();
+      const goal = args.slice(1).join(' ').trim();
+      const spec = getAgent(to);
+      if (!spec) {
+        ctx.out(red(`[交给谁？可选 ${Object.keys(AGENTS).join('/')}]\n`));
+        return;
+      }
+      if (!goal) {
+        ctx.out('[用法：/delegate C 修掉越界读]\n');
+        return;
+      }
+      const from = currentAgent(ctx.state);
+      if (from === to) {
+        ctx.out(red('[不能借调自己]\n'));
+        return;
+      }
+      const token = ctx.ledger.liveTokens(from)[0] ?? null;
+      const budget = token ? Math.max(remaining(token), 1) : 4000;
+      const input: HandoffInput = {
+        taskId: makeTaskId(Date.now() % 100000),
+        from,
+        to: spec.id,
+        goal,
+        slice: '（命令行简版：没有结构化切片，按目标自行判断）',
+        expect: '一句话结论',
+        budgetTokens: budget,
+      };
+      ctx.out(bold(`[借调 ${from} → ${spec.id}｜${spec.title}｜预算 ${fmtInt(budget)} token]`));
+      const res = await runSubagent({
+        as: spec.id,
+        from,
+        input,
+        token,
+        thread: ctx.state.thread,
+        deps: {
+          runner: ctx.agent,
+          ledger: ctx.ledger,
+          module: getModule(spec.home) ?? getModule(DEFAULT_MODULE)!,
+          tail: ctx.state.tail,
+        },
+        onChunk: (s) => process.stdout.write(s),
+      });
+      ctx.out();
+      if (!res.ok) {
+        ctx.out(red(`[借调未通过：${res.notes ?? '（无说明）'}]\n`));
+        return;
+      }
+      const flag = res.budgetHit ? red('（熔断）') : '';
+      ctx.out(green(`[${spec.id} 完成${flag} · ${fmtInt(res.tokens)} token · ${fmtUsd(res.costUsd)}]`));
+      ctx.out(res.output ?? dim('（无可见输出）'));
       ctx.out();
     },
   },

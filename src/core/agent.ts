@@ -12,20 +12,36 @@
  *    这条也是 v2 的地基：权限不该靠提示词，该靠执行层。
  *
  * 3. 角色片挂在用户消息末尾（见 prompt.ts），切模块不动前缀。
+ *
+ * v2 又加了三层，都在执行层：
+ *   · **预算闸门**（budget.ts）：闸门挂在 callModel 之前 —— 输出之后才拦就不叫闸门了。
+ *   · **借调接管**：模型调 delegate 时，callTools 里特判，改由 runSubagent 执行
+ *     （先过令牌 + 预算）。工具层的 delegate 是个占位，真正干活在这。
+ *   · **思考预算分级**：按栈顶模块的 think 档选模型实例（`modelKwargs` 走请求体，
+ *     不进 prompt，所以不动前缀缓存）。开关由 /thinktest 实测得出，见 think.ts。
+ * 运行时（meter / 预算 / 借调上下文 / 当前档位）用闭包变量传进节点，
+ * 借调嵌套时靠「保存-设置-恢复」保证各自读各自的计量。
  */
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 import { AIMessage, HumanMessage, SystemMessage, ToolMessage, isAIMessage, type BaseMessage } from '@langchain/core/messages';
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { BaseCheckpointSaver } from '@langchain/langgraph';
 import { END, START, StateGraph, Annotation, messagesStateReducer } from '@langchain/langgraph';
 import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 import { ChatDeepSeek } from '@langchain/deepseek';
 
+import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
 import { maxOut, memoryPath, modelName } from './config.js';
+import type { Token } from './grant.js';
+import { makeTaskId, parseHandoffInput } from './handoff.js';
+import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
-import { DEFAULT_MODULE, MODULES, getModule, type AgentModule } from './modules.js';
+import { DEFAULT_MODULE, MODULES, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
 import { STABLE_PREFIX, renderUserContent } from './prompt.js';
+import { runSubagent, type TurnRunner } from './subagent.js';
+import { THINK_KWARGS } from './think.js';
 import { ALL_TOOLS, TOOL_MAP } from './tools.js';
 
 export const StateAnnotation = Annotation.Root({
@@ -40,11 +56,38 @@ export const StateAnnotation = Annotation.Root({
   }),
 });
 
+/**
+ * 借调上下文（M2）。delegate 的**执行层**要用的东西 —— 工具本身拿不到，
+ * 由会话层（repl / 命令）在 run 时注入。
+ */
+export interface DelegateContext {
+  ledger: Ledger;
+  /** 主会话 thread（子 thread 由它派生） */
+  thread: string;
+  /** 谁在借调（栈顶模块的归属身份） */
+  from: AgentId;
+  /** 当前身份手上的令牌；没有就 null（A 免令牌，副 agent 会被拒） */
+  token: Token | null;
+  /** 跑子任务的执行器（通常就是同一个 HiveAgent） */
+  runner: TurnRunner;
+  /** 取某身份的主模块 */
+  moduleOf: (as: AgentId) => AgentModule;
+  tail: boolean;
+  /** 生成子任务序号 */
+  seq: () => number;
+  /** 造下一层借调上下文（A→B→C 嵌套）—— 令牌是上一层刚签给 as 的 */
+  makeChild: (childToken: Token, childThread: string, as: AgentId) => DelegateContext;
+}
+
 export interface TurnRequest {
   text: string;
   threadId: string;
   module: AgentModule;
   tail: boolean;
+  /** v2：这一轮的 token 预算闸门。0 / 不传 = 无闸门 */
+  budgetTokens?: number;
+  /** v2：借调上下文。不传 = 这一轮里 delegate 不可用 */
+  delegate?: DelegateContext;
 }
 
 export interface TurnResult {
@@ -53,29 +96,103 @@ export interface TurnResult {
   /** 实际发出去的那条用户消息（含角色片），/anatomy 用 */
   sentContent: string;
   meter: TokenMeter;
+  /** v2：这一轮是否被预算闸门熔断（模型没再被调用） */
+  budgetHit: boolean;
 }
 
 export interface AgentOptions {
   model?: string;
   memoryPath?: string;
+  /** 注入的模型实例 —— 测试用假模型，生产线不传。传了则三档共用它、盖过 model 名 */
+  chat?: BaseChatModel;
 }
 
-function buildModel(modelId: string): ChatDeepSeek {
+/** 一轮的运行时：计量器 + 预算上限 + 借调上下文 + 当前思考档 */
+interface GraphRuntime {
+  meter: TokenMeter | null;
+  budgetTokens: number;
+  delegate: DelegateContext | null;
+  think: ThinkBudget;
+}
+
+/** 建一个带思考档位的模型。档位映射见 think.ts（由 /thinktest 实测得出） */
+function buildModel(modelId: string, think: ThinkBudget): ChatDeepSeek {
   const cap = maxOut();
+  const kwargs = THINK_KWARGS[think];
   return new ChatDeepSeek({
     model: modelId,
     temperature: 0,
     maxRetries: 2,
     ...(cap ? { maxTokens: cap } : {}),
+    ...(Object.keys(kwargs).length ? { modelKwargs: kwargs } : {}),
   });
 }
 
-function buildGraph(model: ChatDeepSeek, checkpointer: BaseCheckpointSaver) {
-  const bound = model.bindTools(ALL_TOOLS);
+function asObj(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+}
+
+/**
+ * delegate 的执行层接管。到这里说明白名单已放行（当前身份能借调），
+ * 剩下的交给 runSubagent —— 它再过令牌与预算。
+ */
+async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<string> {
+  const ctx = runtime.delegate;
+  if (!ctx) return 'ERROR: 当前没有借调上下文（delegate 只能在会话里用）';
+
+  const a = asObj(args);
+  const parsed = parseHandoffInput({
+    taskId: makeTaskId(ctx.seq()),
+    from: ctx.from,
+    to: a['to'],
+    goal: a['goal'],
+    slice: a['slice'],
+    expect: a['expect'],
+    budgetTokens: a['budgetTokens'],
+  });
+  if (!parsed.ok) return `ERROR: 交接参数不合法 —— ${parsed.reason}`;
+
+  const input = parsed.value;
+  const res = await runSubagent({
+    as: input.to,
+    from: ctx.from,
+    input,
+    token: ctx.token,
+    thread: ctx.thread,
+    deps: {
+      runner: ctx.runner,
+      ledger: ctx.ledger,
+      module: ctx.moduleOf(input.to),
+      tail: ctx.tail,
+      // 子任务里还能再借调（A→B→C）：把同一套 makeChild 递归传下去
+      makeChildDelegate: (childToken, childThread) => ctx.makeChild(childToken, childThread, input.to),
+    },
+  });
+
+  if (!res.ok) return `ERROR: 借调 ${input.to} 未通过 —— ${res.notes ?? '（无说明）'}`;
+  const flag = res.budgetHit ? '·熔断' : '';
+  return `[${input.to}${flag} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+}
+
+function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: BaseCheckpointSaver) {
+  // 当前这一轮的运行时。一次只有一个活跃 run（REPL 串行），
+  // 借调嵌套时用「保存-设置-恢复」保证各自读各自的计量。
+  let runtime: GraphRuntime = { meter: null, budgetTokens: 0, delegate: null, think: 'low' };
+
+  // 注入的模型必须支持 bindTools（ChatDeepSeek 与测试用假模型都实现了它）
+  const bound = {
+    off: models.off.bindTools!(ALL_TOOLS),
+    low: models.low.bindTools!(ALL_TOOLS),
+    high: models.high.bindTools!(ALL_TOOLS),
+  };
 
   const callModel = async (state: typeof StateAnnotation.State) => {
+    // §6：闸门在模型调用之前。超了就不发请求，直接熔断这一轮
+    if (runtime.meter && exceedsBudget(runtime.meter, runtime.budgetTokens)) {
+      throw new BudgetExceeded(tokenSpent(runtime.meter), runtime.budgetTokens);
+    }
     const messages = [new SystemMessage(STABLE_PREFIX), ...state.messages];
-    const reply = await bound.invoke(messages);
+    const reply = await bound[runtime.think].invoke(messages);
     return { messages: [reply] };
   };
 
@@ -95,6 +212,9 @@ function buildGraph(model: ChatDeepSeek, checkpointer: BaseCheckpointSaver) {
         result = `ERROR: 没有这个工具 ${name}`;
       } else if (!allowed.has(name)) {
         result = `ERROR: 当前模块（${mod.id}）没开 ${name}`;
+      } else if (name === 'delegate') {
+        // 借调走执行层：先令牌 + 预算，再由 runSubagent 跑
+        result = await handleDelegate(call.args, runtime);
       } else {
         try {
           result = String(await fn.invoke(call.args));
@@ -115,20 +235,28 @@ function buildGraph(model: ChatDeepSeek, checkpointer: BaseCheckpointSaver) {
     return END;
   };
 
-  return new StateGraph(StateAnnotation)
+  const app = new StateGraph(StateAnnotation)
     .addNode('agent', callModel)
     .addNode('tools', callTools)
     .addEdge(START, 'agent')
     .addConditionalEdges('agent', route, { tools: 'tools', [END]: END })
     .addEdge('tools', 'agent')
     .compile({ checkpointer });
+
+  return {
+    app,
+    setRuntime: (r: GraphRuntime): void => {
+      runtime = r;
+    },
+    getRuntime: (): GraphRuntime => runtime,
+  };
 }
 
 export class HiveAgent {
   readonly modelId: string;
   readonly memoryFile: string;
 
-  private readonly app: ReturnType<typeof buildGraph>;
+  private readonly graph: ReturnType<typeof buildGraph>;
 
   constructor(opts: AgentOptions = {}) {
     this.modelId = opts.model ?? modelName();
@@ -146,16 +274,35 @@ export class HiveAgent {
       }
     }
 
-    this.app = buildGraph(buildModel(this.modelId), checkpointer);
+    // 思考档 → 模型实例。注入假模型时三档共用它（假模型忽略 modelKwargs）
+    const models: Record<ThinkBudget, BaseChatModel> = opts.chat
+      ? { off: opts.chat, low: opts.chat, high: opts.chat }
+      : {
+          off: buildModel(this.modelId, 'off'),
+          low: buildModel(this.modelId, 'low'),
+          high: buildModel(this.modelId, 'high'),
+        };
+    this.graph = buildGraph(models, checkpointer);
   }
 
   /**
    * 跑一轮，边跑边把可见文本喂给 onChunk。
    * 计量挂在 callbacks 上，工具轮（两次调用）会自然累加。
+   * 带 budgetTokens 时，超过预算的那次 callModel 直接熔断，本轮以 budgetHit 收尾。
+   * 带 delegate 时，模型调 delegate 会经执行层接手（令牌 + 预算）。
+   * 思考档由 req.module.think 决定（一级分级）。
    */
   async run(req: TurnRequest, onChunk?: (piece: string) => void): Promise<TurnResult> {
     const meter = new TokenMeter({ model: this.modelId });
     const sentContent = renderUserContent(req.text, req.module, { tail: req.tail });
+
+    const saved = this.graph.getRuntime();
+    this.graph.setRuntime({
+      meter,
+      budgetTokens: req.budgetTokens ?? 0,
+      delegate: req.delegate ?? null,
+      think: req.module.think,
+    });
 
     const config = {
       configurable: { thread_id: req.threadId },
@@ -164,31 +311,38 @@ export class HiveAgent {
     };
 
     let text = '';
-    const stream = (await this.app.stream(
-      { messages: [new HumanMessage(sentContent)], module: req.module.id },
-      config,
-    )) as AsyncIterable<[BaseMessage, Record<string, unknown>]>;
+    try {
+      const stream = (await this.graph.app.stream(
+        { messages: [new HumanMessage(sentContent)], module: req.module.id },
+        config,
+      )) as AsyncIterable<[BaseMessage, Record<string, unknown>]>;
 
-    for await (const [chunk, meta] of stream) {
-      if (meta?.['langgraph_node'] !== 'agent') continue;
-      const piece = contentToText(chunk.content);
-      if (!piece) continue;
-      text += piece;
-      onChunk?.(piece);
+      for await (const [chunk, meta] of stream) {
+        if (meta?.['langgraph_node'] !== 'agent') continue;
+        const piece = contentToText(chunk.content);
+        if (!piece) continue;
+        text += piece;
+        onChunk?.(piece);
+      }
+    } catch (e) {
+      if (isBudgetExceeded(e)) return { text, sentContent, meter, budgetHit: true };
+      throw e;
+    } finally {
+      this.graph.setRuntime(saved);
     }
 
-    return { text, sentContent, meter };
+    return { text, sentContent, meter, budgetHit: false };
   }
 
   async history(threadId: string): Promise<BaseMessage[]> {
-    const snap = await this.app.getState({ configurable: { thread_id: threadId } });
+    const snap = await this.graph.app.getState({ configurable: { thread_id: threadId } });
     const values = snap?.values as { messages?: BaseMessage[] } | undefined;
     return values?.messages ?? [];
   }
 
   async checkpoints(threadId: string, limit = 5): Promise<Array<{ step: number; next: string; id: string }>> {
     const out: Array<{ step: number; next: string; id: string }> = [];
-    const iter = this.app.getStateHistory({ configurable: { thread_id: threadId } });
+    const iter = this.graph.app.getStateHistory({ configurable: { thread_id: threadId } });
     for await (const snap of iter as AsyncIterable<{
       next?: string[];
       metadata?: { step?: number };

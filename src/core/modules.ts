@@ -6,6 +6,9 @@
  *
  * v2 起每个模块挂在一个 agent（A 主 / B 侦察 / C 修复 / D 审计）名下，
  * 见下面的 AGENTS 表：身份决定「能借调谁」，而执行层按栈顶模块收权。
+ *
+ * 工具白名单注意：工具定义（ALL_TOOLS）给**所有模块**看，这里列的是**执行层**
+ * 允许谁真正调用哪个。delegate 只给能借调的身份（A / B）开；write_file 给 C 开。
  */
 export type ThinkBudget = 'off' | 'low' | 'high';
 
@@ -24,11 +27,11 @@ export interface AgentModule {
    * 写短：它每轮都在，长了就是每轮都在付钱。
    */
   fragment: string;
-  /** 该模块可用的工具名，空数组 = 不给工具 */
+  /** 该模块可用的工具名（执行层白名单），空数组 = 不给工具 */
   tools: string[];
   /**
-   * 思考预算。DeepSeek 那侧的开关还没验证出结论（/thinktest 在 M1 落地），
-   * 本阶段只记录意向、不强行施加，免得两条变量混在一起，账本读不出来。
+   * 思考预算。→ 请求字段的映射见 think.ts 的 THINK_KWARGS（由 /thinktest 实测得出）：
+   * off / low 关思考，high 放开。agent.ts 按栈顶模块的 think 档选模型实例。
    */
   think: ThinkBudget;
   /** 这个模块属于哪个 agent（A 主 / B 侦察 / C 修复 / D 审计） */
@@ -39,9 +42,9 @@ export const MODULES: Record<string, AgentModule> = {
   assistant: {
     id: 'assistant',
     title: '通用',
-    summary: '默认助手：读文件、算数，一句话作答',
-    fragment: '当前是通用助手：能读文件、能算数，只答问题本身。',
-    tools: ['calculator', 'read_file'],
+    summary: '主控 A：读文件、算数、把子任务借调出去',
+    fragment: '当前是主控：能读文件、能算数，需要动手时把子任务交给别的角色。',
+    tools: ['calculator', 'read_file', 'delegate'],
     think: 'low',
     owner: 'A',
   },
@@ -57,10 +60,10 @@ export const MODULES: Record<string, AgentModule> = {
   recon: {
     id: 'recon',
     title: '侦察',
-    summary: '信息收集：只陈列事实与来源，不做判断（v2 给 B agent）',
+    summary: '信息收集：只陈列事实与来源，需要动手时借调 C/D（v2 给 B agent）',
     fragment:
       '当前是侦察角色：只收集并陈列事实，标出每条事实的来源（哪个文件、哪一行）；不给建议、不下结论。',
-    tools: ['read_file'],
+    tools: ['read_file', 'delegate'],
     think: 'high',
     owner: 'B',
   },
@@ -69,9 +72,8 @@ export const MODULES: Record<string, AgentModule> = {
     title: '修复',
     summary: '按给定目标与差异改文件，不扩大范围（v2 给 C agent）',
     fragment: '当前是修复角色：只按给定的目标与差异改文件，不顺手重构、不扩大范围。',
-    // M1 零新工具（工具 schema 属缓存前缀，改动要一次加齐）。
-    // write_file 与 delegate 在 M2 一起进 ALL_TOOLS —— 那时前缀只作废一次。
-    tools: ['read_file'],
+    // 工具一次加齐（§7）：write_file 让 C 能真正动手改文件
+    tools: ['read_file', 'write_file'],
     think: 'low',
     owner: 'C',
   },

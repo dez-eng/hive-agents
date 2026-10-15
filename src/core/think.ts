@@ -1,16 +1,19 @@
 /**
- * 思考开关探针 —— `/thinktest` 的脑子。
+ * 思考开关探针 —— `/thinktest` 的脑子，也是**思考预算分级的依据**。
  *
  * 为什么要实测：阶段 6.7 量出**思考占总花费 32%**，但「能不能关、怎么关」
  * 一直是悬案（当时那个 /thinktest 没跑出结论）。猜参数名没意义 ——
  * 同一个问题多跑几组候选，看哪一组把思考 token 打到 0，那才叫结论。
  *
- * 纯逻辑（候选表、判定）全在这里，可单测；真调用走 runThinkProbe。
+ * 2026-10-15 实测结论（deepseek-flash，见 THINK_KWARGS 的注释）。
+ *
+ * 纯逻辑（候选表、判定、预算映射）全在这里，可单测；真调用走 runThinkProbe。
  */
 import { ChatDeepSeek } from '@langchain/deepseek';
 import { HumanMessage } from '@langchain/core/messages';
 
 import { TokenMeter } from './meter.js';
+import type { ThinkBudget } from './modules.js';
 
 export interface ThinkCandidate {
   /** 给人看的名字，也是账本里 user_head 那栏 */
@@ -48,6 +51,28 @@ export const THINK_CANDIDATES: ThinkCandidate[] = [
     why: '同上，极端档 —— 能一下打到 0 最好',
   },
 ];
+
+/**
+ * 模块思考预算 → 请求字段。**这是 /thinktest 的产物**，不是猜的。
+ *
+ * 2026-10-15 实测（deepseek-flash，问题「1+1 只回数字」）：
+ *   · 默认                       思考 38 · 出 40 · $0.000031
+ *   · thinking.type=disabled     思考  0 · 出  1 · $0.000003  ← 开关
+ *   · thinking.type=enabled      思考 27 · 出 29             ← 对照组，证明字段被读进去
+ *   · reasoning_effort=minimal   思考 38（与默认同）          ← 无效
+ *   · reasoning_effort=none      思考  0                     ← 也关得掉，但不留两个开关
+ *
+ * 结论：**只有开 / 关两态**，没有可用的「低」档。于是：
+ *   · off  查表/算术类 —— 关思考（calc）
+ *   · low  轻量角色也关 —— 省 token 是这个项目的宗旨；assistant 的活是「分工/委派」，
+ *          不需要深思考。若发现主控变笨，把 modules.ts 里 assistant.think 改成 high 即可
+ *   · high 审计/侦察类 —— 放开，由模型自决（默认已思考全开，不必显式 enabled）
+ */
+export const THINK_KWARGS: Record<ThinkBudget, Record<string, unknown>> = {
+  off: { thinking: { type: 'disabled' } },
+  low: { thinking: { type: 'disabled' } },
+  high: {},
+};
 
 /** 一次探针的计量 */
 export interface ThinkSample {

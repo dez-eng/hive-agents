@@ -242,3 +242,12 @@ test('账本：交接记录写进去、按 task 汇总得出来', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('执行层总闸：A 是签发者，自带权限 —— 无需令牌', () => {
+  // §4：借调默认由 A 自行决定。A 拿不出「签给自己的令牌」（issueToken 也拒 to=A），
+  // 所以授权层必须放行 A，否则主控根本借不动任何人。
+  const v = authorizeDelegate({ from: 'A', to: 'C', token: null, needTokens: 200, now: NOW });
+  assert.equal(v.ok, true);
+  // 身份表那一道仍然管得住 A：不能借调自己
+  assert.equal(authorizeDelegate({ from: 'A', to: 'A', token: null, needTokens: 1, now: NOW }).ok, false);
+});

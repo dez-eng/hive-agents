@@ -41,6 +41,31 @@
 
 ---
 
+## 多 agent（v2）：A 主 + B/C/D 副
+
+v2 不引入第二份 prompt。全系统仍只有一段 `STABLE_PREFIX` + 一套工具 schema，
+agent 之间的差别只体现在两处 —— **栈顶那句模块片**（尾部、边际成本≈0）和**执行层权限**。
+
+| 身份 | 角色 | 主模块 | 可借调 |
+|---|---|---|---|
+| A | 主控：持会话、精简、再分配 | `assistant` | B / C / D |
+| B | 侦察：只陈列事实 | `recon` | C / D |
+| C | 修复：按目标改文件 | `fix` | — |
+| D | 审计：复核结论与事实 | `audit` | — |
+
+- **无状态副 agent**：B/C/D 的记忆是 `thread#身份#taskId` 的一次性 checkpoint，跑完即弃 ——
+  拿不到 A 的历史，是物理隔离，不是提示词叮嘱
+- **结构化交接**：agent 之间只传 `{goal, slice, expect, budget}`，schema 里没有「原文」入口
+- **授权令牌**：副 agent 借调要走 A 签发的令牌（`/grant` 手动，或 A 借调时自动签发），
+  校验拦在执行层 —— 模型看不到也绕不过
+- **预算闸门**：按 token 计，闸门在 `callModel` **之前**；超了就熔断，不进模型
+- **模块栈**：`/use` 压栈、`/pop` 弹栈，借调结束回到原角色（栈式恢复，不是覆盖）
+- **痕迹**：子任务 checkpoint 弃、`handoffs` 表留，逐轮 token 仍入账本
+
+设计与里程碑见 [`V2-PLAN.md`](./V2-PLAN.md)。
+
+---
+
 ## 装上
 
 ```bash
@@ -74,21 +99,27 @@ hive doctor          # 环境自检（含计量字段校准）
 | `/turn 3` | 第 3 轮明细 |
 | `/turn 2-5` | 第 2~5 轮合计 ← **查某聊天段花了多少** |
 | `/find 关键词` | 跨历史搜轮次 |
-| `/modules` · `/use <id>` | 列模块 / 切模块 |
+| `/modules` · `/use <id>` | 列模块 / 切模块（压栈） |
+| `/stack` · `/pop` | 看模块栈 / 弹一层（借调结束回到原角色） |
+| `/as A\|B\|C\|D` | 切身份（压入该 agent 的主模块） |
+| `/delegate <身份> <目标>` | 把任务交给另一个身份（令牌 + 预算闸门 + 独立 thread） |
+| `/grant <身份> <预算>` | 签发借调令牌（默认自动签发之外的收紧手段） |
+| `/handoffs [n]` | 交接记录：谁把什么交给了谁、花了多少 |
+| `/budget` | 本会话令牌与预算余额 |
 | `/tail on\|off` | 尾部角色片开关（关掉做 A/B 对照） |
 | `/status on\|off` | 底部状态行开关 |
 | `/new` | 开新会话（冷缓存） |
 | `/history` | 存档点 |
 | `/help` | 全部命令 |
-| `/anatomy` `/misscheck` `/lenstat` `/ledger` | 诊断（默认不列在 help 里，`/help all` 看） |
+| `/anatomy` `/misscheck` `/lenstat` `/ledger` `/thinktest` | 诊断（默认不列在 help 里，`/help all` 看） |
 
 底部常驻一行：
 
 ```
-hive · deepseek-flash · 谷 · 通用+尾 │ 本轮 $0.000043 思考32% k=2 │ 会话 $0.0012/12轮 均118出 │ 上下文 7.4k 命中92% │ 历史 $0.0056 41行
+hive · deepseek-flash · 谷 · 通用+尾 │ 本轮 $0.000043 思考32% k=2 │ 会话 $0.0012/12轮 均118出 │ 上下文 7.4k 命中92% │ 历史 $0.0056 41行 │ 栈 A›B
 ```
 
-宽度不够就自动丢右边的段，绝不换行。账单细节一律藏在命令里。
+宽度不够就自动丢右边的段（栈段最先丢），绝不换行。账单细节一律藏在命令里。
 
 ## 环境变量
 
@@ -108,8 +139,11 @@ hive · deepseek-flash · 谷 · 通用+尾 │ 本轮 $0.000043 思考32% k=2 �
 ```sql
 ledger(ts, day, run_id, thread_id, model, band, tag, module, calls,
        in_tok, cache_hit, out_tok, reason_tok, user_chars,
-       user_head, out_head, cost_usd, style_on)
+       user_head, out_head, cost_usd, style_on,
+       agent, task_id, budget_tok, budget_hit)
 ```
+
+v2 又加了两张表：`tokens`（授权令牌）与 `handoffs`（交接记录）。
 
 `/misscheck` 会逐对检查几何律是否仍然成立于你的真实数据上 —— 这是唯一能证明
 「前缀缓存真的命中了」的手段，比任何猜测都硬。
@@ -124,20 +158,21 @@ npm run build       # 产物在 dist/
 
 ## 路线图
 
-v0.1（本版，骨架）已经把地基铺好了：
+v0.1（骨架）与 v2 的 M1/M2 都已落地：
 
 - [x] 缓存友好前缀 + 尾部模块槽位
 - [x] 执行层权限（模块白名单）
 - [x] token 账本 + 几何律检验
 - [x] 底部状态行 / 命令面板
+- [x] 主 agent A 独占工作记忆，副 agent 无状态、只拿任务切片
+- [x] 结构化交接（schema 化的 handoff，不传原文）
+- [x] 授权通道：B 借调 C/D 需先取得 A 签发的令牌 → 子任务带预算闸门
+- [x] 模块栈：借调结束后回到原角色（栈式恢复，不是覆盖）
+- [x] 工具一次加齐（`write_file` / `delegate`，一次性前缀税）
+- [x] 思考预算按任务分级（查表类关思考、审计类放开）—— `/thinktest` 实测开关为 `thinking.type=disabled`，映射见 `think.ts` 的 `THINK_KWARGS`
 
-v0.2 起往「A 主 + B/C/D 副」走：
-
-- [ ] 主 agent A 独占工作记忆，副 agent 无状态、只拿任务切片
-- [ ] 结构化交接（schema 化的 handoff，不传原文）
-- [ ] 授权通道：B 借调 C/D 需先向 A 申请 → A 发令牌 → 子任务带预算闸门
-- [ ] 模块栈：借调结束后回到原角色（栈式恢复，不是覆盖）
-- [ ] 思考预算按任务分级（查表类关思考、审计类放开）—— 先跑 `/thinktest` 把开关验证出来
+M3（真机）：A→B→C 借调跑一轮，核账 —— 命中率有没有掉、思考占比多少。
+`/thinktest` 已跑出结论（`thinking.type=disabled` 把思考打到 0），模块分级已接上。
 
 ## License
 

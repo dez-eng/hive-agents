@@ -3,15 +3,21 @@
  *   · 命令以 / 开头，非命令输入直接发给模型（尾部挂当前模块角色片）
  *   · 回答期间 pause 输入，回答完把底部状态行补齐，再恢复提示符
  *   · 任何异常都不该把会话弄死
+ *
+ * v2：每一轮都带上**借调上下文**（DelegateContext）—— 模型在本轮里调 delegate
+ * 时，执行层才有东西可查（令牌、账本、子执行器）。当前身份由模块栈顶决定。
+ * 借调上下文可递归：A 借调 B 时，B 的子任务里拿到的是同一套 makeChild，
+ * 于是 A→B→C 的嵌套在子任务里也能继续。
  */
 import { createInterface, type Interface } from 'node:readline';
 
 import { APP_NAME, VERSION, currentBand, ledgerPath, memoryPath } from './core/config.js';
-import { HiveAgent, type HiveAgent as AgentType } from './core/agent.js';
+import { HiveAgent, type DelegateContext, type HiveAgent as AgentType } from './core/agent.js';
+import type { Token } from './core/grant.js';
 import { Ledger } from './core/ledger.js';
 import { SessionTally } from './core/meter.js';
-import { getModule } from './core/modules.js';
-import { currentModuleId, newReplState, type ReplState } from './core/session.js';
+import { AGENTS, DEFAULT_MODULE, getAgent, getModule } from './core/modules.js';
+import { currentAgent, currentModuleId, newReplState, type ReplState } from './core/session.js';
 import { findCommand, footerInput, knownCommandNames, type Ctx } from './commands.js';
 import { bold, cyan, dim, fmtUsd, gray, red } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
@@ -54,6 +60,37 @@ export function printFooter(ctx: Ctx): void {
   process.stdout.write(`${renderFooter(footerInput(ctx))}\n`);
 }
 
+let delegateSeq = 0;
+
+/**
+ * 借调上下文 —— 会话层把执行层需要的东西装好。
+ * 身份取模块栈顶；令牌：A 免令牌（它是签发者），副 agent 取 A 签给它的有效令牌。
+ * `makeChild` 递归造下一层，令牌换成上一层刚签给子 agent 的那张 → 栈式借调。
+ */
+export function makeDelegateContext(ctx: Ctx): DelegateContext {
+  const moduleOf = (as: Parameters<DelegateContext['moduleOf']>[0]): ReturnType<DelegateContext['moduleOf']> =>
+    getModule(getAgent(as)?.home ?? DEFAULT_MODULE) ?? getModule(DEFAULT_MODULE)!;
+  const seq = (): number => {
+    delegateSeq += 1;
+    return delegateSeq;
+  };
+
+  const make = (from: DelegateContext['from'], token: Token | null, thread: string): DelegateContext => ({
+    ledger: ctx.ledger,
+    thread,
+    from,
+    token,
+    runner: ctx.agent,
+    moduleOf,
+    tail: ctx.state.tail,
+    seq,
+    makeChild: (childToken, childThread, as) => make(as, childToken, childThread),
+  });
+
+  const from = currentAgent(ctx.state);
+  return make(from, ctx.ledger.liveTokens(from)[0] ?? null, ctx.state.thread);
+}
+
 const EXIT_WORDS = new Set(['/exit', 'exit', 'quit', 'q', '退出', '再见']);
 
 function banner(ctx: Ctx): void {
@@ -68,7 +105,7 @@ function banner(ctx: Ctx): void {
   );
   ctx.out(
     dim(
-      `checkpoint ${memoryPath()} · 模块 ${currentModuleId(ctx.state)}` +
+      `checkpoint ${memoryPath()} · 模块 ${currentModuleId(ctx.state)} · 身份 ${currentAgent(ctx.state)}` +
         (ctx.state.tail ? ' · 尾部角色片 开' : ' · 尾部角色片 关'),
     ),
   );
@@ -85,7 +122,13 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
   let answer = '';
   try {
     const res = await ctx.agent.run(
-      { text, threadId: ctx.state.thread, module: mod, tail: ctx.state.tail },
+      {
+        text,
+        threadId: ctx.state.thread,
+        module: mod,
+        tail: ctx.state.tail,
+        delegate: makeDelegateContext(ctx),
+      },
       (piece) => {
         process.stdout.write(piece);
       },
@@ -112,6 +155,7 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
       outHead: answer,
       styleOn: ctx.state.tail ? 1 : 0,
       band: res.meter.band,
+      agent: currentAgent(ctx.state),
     });
   } catch (e) {
     process.stdout.write('\n');
@@ -184,4 +228,4 @@ export async function startRepl(opts: ContextOptions = {}): Promise<void> {
   ctx.out(gray('再见。'));
 }
 
-export { renderFooter };
+export { AGENTS, renderFooter };

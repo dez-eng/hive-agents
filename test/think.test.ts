@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 
 import {
   THINK_CANDIDATES,
+  THINK_KWARGS,
   pickThinkingOff,
   thinkVerdict,
   type ThinkSample,
 } from '../src/core/think.js';
+import { moduleList } from '../src/core/modules.js';
 
 function s(label: string, reasonTok: number, ok = true): ThinkSample {
   return { label, ok, inTok: 100, outTok: 50, reasonTok, costUsd: 0.0001 };
@@ -49,4 +51,16 @@ test('判定：失败的样本不参与挑选，但全失败会说出来', () =>
   // 基线失败、后面的成功：成功的第一个顶上来当基线
   const off = pickThinkingOff([s('默认', 0, false), s('a', 100), s('b', 0)]);
   assert.equal(off?.label, 'b');
+});
+
+test('思考预算映射来自实测：off/low 关思考，high 放开', () => {
+  assert.deepEqual(THINK_KWARGS.off, { thinking: { type: 'disabled' } });
+  assert.deepEqual(THINK_KWARGS.low, { thinking: { type: 'disabled' } });
+  assert.deepEqual(THINK_KWARGS.high, {}, 'high 放开：默认已思考全开，不必显式 enabled');
+});
+
+test('每个模块的 think 档都有映射 —— 漏了会把 undefined 塞进 modelKwargs', () => {
+  for (const m of moduleList()) {
+    assert.ok(m.think in THINK_KWARGS, `${m.id} 的 think=${m.think} 没有映射`);
+  }
 });

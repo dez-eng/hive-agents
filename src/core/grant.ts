@@ -128,6 +128,9 @@ export function authorizeDelegate(req: AuthorizeRequest): Verdict {
   if (!mayDelegate(req.from, req.to)) {
     return { ok: false, reason: `${req.from} 无权借调 ${req.to}（身份表 mayCall 里没有）` };
   }
+  // A 是签发者，自带权限 —— §4「借调默认由 A 自行决定」，它不需要向自己领令牌。
+  // 子任务的预算仍由 input.budgetTokens 在 runSubagent 里熔断，不是没有闸门。
+  if (req.from === 'A') return { ok: true };
   if (!req.token) return { ok: false, reason: `${req.from} 借调 ${req.to} 需要令牌，但没有` };
   if (req.token.issuedBy !== 'A') {
     return { ok: false, reason: `令牌只能由 A 签发，这张是 ${req.token.issuedBy} 签的` };
