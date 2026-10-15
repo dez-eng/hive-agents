@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+
+# 运行时产物：账本与 checkpoint，不进版本库
+*.db
+*.db-wal
+*.db-shm
+
+# 凭证
+.env
+.env.local

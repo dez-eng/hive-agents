@@ -1,0 +1,12 @@
+# 仓库里一律按 LF 存，避免同一份代码在不同平台 checkout 出不同的换行
+* text=auto eol=lf
+
+# Windows 脚本得留 CRLF，否则某些宿主不认
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.db binary
+*.zip binary

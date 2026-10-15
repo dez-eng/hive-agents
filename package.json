@@ -1,0 +1,46 @@
+{
+  "name": "hive-agents",
+  "version": "0.1.0",
+  "description": "One stable prefix, swappable role modules, built-in token accounting — a cache-friendly multi-agent CLI.",
+  "keywords": [
+    "agent",
+    "langgraph",
+    "llm",
+    "cli",
+    "token",
+    "prompt-cache"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "hive": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.2.17",
+    "@langchain/deepseek": "^1.1.17",
+    "@langchain/langgraph": "^1.5.0",
+    "@langchain/langgraph-checkpoint-sqlite": "^1.1.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.2"
+  }
+}
