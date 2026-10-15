@@ -68,3 +68,13 @@ export function makeTaskId(seq: number, rnd: string = Math.random().toString(16)
 export function subThread(thread: string, as: (typeof AGENT_IDS)[number], taskId: string): string {
   return `${thread}#${as}#${taskId}`;
 }
+
+/**
+ * v3：独立会话的 thread —— `solo#B`，**可续**。
+ * 与借调子任务（`main#C#t001-xxxx`，跑完即弃 checkpoint）相对：
+ * 独立会话是「这个 agent 单独当产品用」，它的 checkpoint 必须留着，
+ * 否则 `hive --as B --continue` 无从谈起（见 docs/V3-PLAN.md §2.3）。
+ */
+export function soloThread(as: (typeof AGENT_IDS)[number]): string {
+  return `solo#${as}`;
+}

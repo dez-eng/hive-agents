@@ -3,9 +3,12 @@
  *
  * v2 起模块不再是「一个 id」而是「一个栈」（见 stack.ts）：
  * 栈底 = A 的主模块，栈顶 = 当前执行者。借调结束弹一层就回到原角色。
+ *
+ * v3：多了一个「以某身份独立启动」的入口（`hive --as B`）——
+ * 它的栈底直接是该 agent 的主模块，而不是靠压栈压出来的。
  */
 import type { TokenMeter } from './meter.js';
-import { DEFAULT_AGENT, DEFAULT_MODULE, agentOf, type AgentId } from './modules.js';
+import { AGENTS, DEFAULT_AGENT, DEFAULT_MODULE, agentOf, type AgentId } from './modules.js';
 import { stackTop } from './stack.js';
 
 export interface ReplState {
@@ -32,6 +35,16 @@ export function newReplState(thread: string): ReplState {
     lastTurn: null,
     lastSent: '',
   };
+}
+
+/**
+ * v3：以某个身份独立启动（`hive --as B`）的会话状态。
+ * 栈底直接放该 agent 的主模块 —— 与借调（压栈）不同，这是「我本来就是这个角色」。
+ */
+export function newReplStateFor(thread: string, as: AgentId): ReplState {
+  const st = newReplState(thread);
+  st.stack = [AGENTS[as].home];
+  return st;
 }
 
 /** 当前模块 id = 栈顶。prompt 尾部挂它、执行层按它收权 */

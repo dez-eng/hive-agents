@@ -8,16 +8,20 @@
  * 时，执行层才有东西可查（令牌、账本、子执行器）。当前身份由模块栈顶决定。
  * 借调上下文可递归：A 借调 B 时，B 的子任务里拿到的是同一套 makeChild，
  * 于是 A→B→C 的嵌套在子任务里也能继续。
+ *
+ * v3：`opts.as` 让任一个 agent 独立启动（`hive --as B`）—— 栈底直接是它的主模块，
+ * thread 挂在 `solo#<id>` 上（可续）。见 docs/V3-PLAN.md §2。
  */
 import { createInterface, type Interface } from 'node:readline';
 
 import { APP_NAME, VERSION, currentBand, ledgerPath, memoryPath } from './core/config.js';
 import { HiveAgent, type DelegateContext, type HiveAgent as AgentType } from './core/agent.js';
 import type { Token } from './core/grant.js';
+import { soloThread } from './core/handoff.js';
 import { Ledger } from './core/ledger.js';
 import { SessionTally } from './core/meter.js';
-import { AGENTS, DEFAULT_MODULE, getAgent, getModule } from './core/modules.js';
-import { currentAgent, currentModuleId, newReplState, type ReplState } from './core/session.js';
+import { AGENTS, DEFAULT_MODULE, getAgent, getModule, type AgentId } from './core/modules.js';
+import { currentAgent, currentModuleId, newReplState, newReplStateFor, type ReplState } from './core/session.js';
 import { findCommand, footerInput, knownCommandNames, type Ctx } from './commands.js';
 import { bold, cyan, dim, fmtUsd, gray, red } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
@@ -26,6 +30,8 @@ export interface ContextOptions {
   agent?: HiveAgent;
   ledger?: Ledger;
   thread?: string;
+  /** v3：以该身份独立启动（栈底放它的主模块，thread 默认 solo#<id>） */
+  as?: AgentId;
 }
 
 export interface BuiltContext {
@@ -41,7 +47,10 @@ export function buildContext(opts: ContextOptions = {}): BuiltContext {
   const ledger = opts.ledger ?? new Ledger();
   const opened = ledger.open();
   const session = new SessionTally();
-  const state = newReplState(opts.thread ?? 'main');
+  const state =
+    opts.as !== undefined
+      ? newReplStateFor(opts.thread ?? soloThread(opts.as), opts.as)
+      : newReplState(opts.thread ?? 'main');
   const ctx: Ctx = {
     agent,
     ledger,
