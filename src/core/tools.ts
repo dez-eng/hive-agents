@@ -99,13 +99,17 @@ export const delegateTool = tool(
   },
   {
     name: 'delegate',
-    description: '把子任务交给另一个 agent（需 A 签发的令牌，受预算闸门限制）。',
+    description: '把子任务交给另一个 agent（需 A 签发的令牌，受预算闸门限制）。预算给足，太小会在子任务里被熔断。',
     schema: z.object({
       to: z.enum(['A', 'B', 'C', 'D']).describe('借调目标身份'),
       goal: z.string().describe('一句话目标'),
       slice: z.string().describe('结构化输入切片：文件路径 + 行号 + 片段，不含对话原文'),
       expect: z.string().describe('期望产物的形状'),
-      budgetTokens: z.number().int().nonnegative().describe('这个子任务的预算（token）'),
+      budgetTokens: z
+        .number()
+        .int()
+        .nonnegative()
+        .describe('这个子任务的预算（token）。太小会被熔断；需要读文件/改文件的任务建议 ≥ 2000'),
     }),
   },
 );

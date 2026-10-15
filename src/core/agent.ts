@@ -170,8 +170,11 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
   });
 
   if (!res.ok) return `ERROR: 借调 ${input.to} 未通过 —— ${res.notes ?? '（无说明）'}`;
-  const flag = res.budgetHit ? '·熔断' : '';
-  return `[${input.to}${flag} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+  if (res.budgetHit) {
+    // 明确告诉上层「是预算不够、不是任务失败」，让它加大预算重试（真机实测过这个坑）
+    return `[${input.to}·熔断 ${res.tokens}/${input.budgetTokens} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
+  }
+  return `[${input.to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
 }
 
 function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: BaseCheckpointSaver) {

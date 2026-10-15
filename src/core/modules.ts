@@ -62,7 +62,7 @@ export const MODULES: Record<string, AgentModule> = {
     title: '侦察',
     summary: '信息收集：只陈列事实与来源，需要动手时借调 C/D（v2 给 B agent）',
     fragment:
-      '当前是侦察角色：只收集并陈列事实，标出每条事实的来源（哪个文件、哪一行）；不给建议、不下结论。',
+      '当前是侦察角色：只收集并陈列事实，标出每条事实的来源（哪个文件、哪一行）；不给建议、不下结论。需要动手改文件时，用 delegate 交给修复角色。',
     tools: ['read_file', 'delegate'],
     think: 'high',
     owner: 'B',
