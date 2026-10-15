@@ -45,7 +45,7 @@
 
 ```bash
 # 还没发 npm，先本地装
-git clone https://github.com/dez-eng/remote.git && cd remote && npm install && npm run build && npm link
+git clone https://github.com/dez-eng/hive-agents.git && cd hive-agents && npm install && npm run build && npm link
 
 # 或者直接用
 npx tsx src/cli.ts

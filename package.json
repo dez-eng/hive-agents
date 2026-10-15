@@ -13,12 +13,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dez-eng/remote.git"
+    "url": "git+https://github.com/dez-eng/hive-agents.git"
   },
   "bugs": {
-    "url": "https://github.com/dez-eng/remote/issues"
+    "url": "https://github.com/dez-eng/hive-agents/issues"
   },
-  "homepage": "https://github.com/dez-eng/remote#readme",
+  "homepage": "https://github.com/dez-eng/hive-agents#readme",
   "type": "module",
   "bin": {
     "hive": "dist/cli.js"
