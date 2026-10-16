@@ -2,177 +2,245 @@
 
 一个把「省 token」当第一性问题的 agent CLI：**一段逐字节不变的前缀 + 挂在消息末尾的角色模块 + 内置的 token 账本**。
 
-基于 langgraph.js（TypeScript / Node），`npm i -g` 后一条 `hive` 就能开。
+TypeScript / langgraph.js。`npm i -g hive-agents` 之后一条 `hive` 就能开。
 
-> 它不是又一个聊天壳子。它是从一批实测里长出来的：阶段 6.7 用 41 组样本量出了
-> **未命中 = (入 mod 64) + 64k** 这条几何律，又量出账单的形状 —
-> 可见输出只占总花费 3%，思考占 32%，未命中输入占 40%。
-> 结论很反直觉：**削「话长」动的是那 3%。**
-
----
-
-## 三条设计约束
-
-这三条不是审美，是钱的形状决定的。改任何一条之前先看 `/cost`。
-
-### 1. system 前缀逐字节不变
-
-前缀一变，后面整段历史全部作废，等于每轮重付全价。所以：
-
-- 系统提示写成 `STABLE_PREFIX` 常量（`src/core/prompt.ts`），改一个字符就要付一次「全盘作废税」
-- 提示不进对话历史，每轮临时拼在最前面 —— 否则它会随历史累积，越聊越贵
-
-### 2. 角色挂在用户消息末尾，不挂在 system
-
-切模块（`/use recon`）= 只换用户消息尾部那几十个 token。因为最末尾那段本来就在
-「必然未命中」的尾巴里，边际成本 ≈ 0。实测过：**挂在开头压不住，挂在尾巴上一句就压住了。**
-
-反过来做 —— 每个角色一份完整 system prompt —— 换一次角色就是整段历史缓存作废。
-
-### 3. 权限收在执行层，不在提示词
-
-所有模块共享**同一套工具定义**（工具 schema 在 prompt 开头，属于前缀的一部分，
-按模块换工具 = 换前缀 = 缓存全废）。所以：
-
-- 指令层给全套工具
-- 执行层按当前模块的白名单挡（`call_tools` 里）
-
-这条也是 v2 多 agent 的地基：**权限不该靠提示词，该靠执行层。**
-
----
-
-## 多 agent（v2）：A 主 + B/C/D 副
-
-v2 不引入第二份 prompt。全系统仍只有一段 `STABLE_PREFIX` + 一套工具 schema，
-agent 之间的差别只体现在两处 —— **栈顶那句模块片**（尾部、边际成本≈0）和**执行层权限**。
-
-| 身份 | 角色 | 主模块 | 可借调 |
-|---|---|---|---|
-| A | 主控：持会话、精简、再分配 | `assistant` | B / C / D |
-| B | 侦察：只陈列事实 | `recon` | C / D |
-| C | 修复：按目标改文件 | `fix` | — |
-| D | 审计：复核结论与事实 | `audit` | — |
-
-- **无状态副 agent**：B/C/D 的记忆是 `thread#身份#taskId` 的一次性 checkpoint，跑完即弃 ——
-  拿不到 A 的历史，是物理隔离，不是提示词叮嘱
-- **结构化交接**：agent 之间只传 `{goal, slice, expect, budget}`，schema 里没有「原文」入口
-- **授权令牌**：副 agent 借调要走 A 签发的令牌（`/grant` 手动，或 A 借调时自动签发），
-  校验拦在执行层 —— 模型看不到也绕不过
-- **预算闸门**：按 token 计，闸门在 `callModel` **之前**；超了就熔断，不进模型
-- **模块栈**：`/use` 压栈、`/pop` 弹栈，借调结束回到原角色（栈式恢复，不是覆盖）
-- **痕迹**：子任务 checkpoint 弃、`handoffs` 表留，逐轮 token 仍入账本
-
-设计与里程碑见 [`V2-PLAN.md`](./V2-PLAN.md)。
+> 它不是又一个聊天壳子。它是从一批实测里长出来的：41 组样本量出
+> **未命中 = (入 mod 64) + 64k** 这条几何律，又量出账单的形状 ——
+> 可见输出只占总花费 3%、思考占 32%、未命中输入占 40%。
+> 结论很反常识：**削「话长」动的是那 3%。**
 
 ---
 
 ## 装上
 
-```bash
-# 还没发 npm，先本地装
-git clone https://github.com/dez-eng/hive-agents.git && cd hive-agents && npm install && npm run build && npm link
-
-# 或者直接用
-npx tsx src/cli.ts
-```
-
-配 API key：
+三种都行，都不需要 npm 账号：
 
 ```bash
-cp .env.example .env   # 填 DEEPSEEK_API_KEY
+npm i -g hive-agents                                       # npm registry
+npm i -g github:dez-eng/hive-agents                        # 直接从 GitHub（会现场编译，约 35s）
+npm i -g https://github.com/dez-eng/hive-agents/releases/download/v0.1.0/hive-agents-0.1.0.tgz
 ```
+
+配 key —— **不配跑不起来**。在你要干活的目录里放一份 `.env`：
+
+```bash
+printf 'DEEPSEEK_API_KEY=sk-你的key\n' > .env
+```
+
+或者直接 `export DEEPSEEK_API_KEY=...`。需要 **Node ≥ 22.5**（用了内置的 `node:sqlite` 与 `process.loadEnvFile`）。
 
 ## 用
 
-```
-hive                 # 交互会话
-hive run "3*7 等于几" # 单轮，适合脚本
-hive doctor          # 环境自检（含计量字段校准）
+```bash
+hive                      # 交互会话（主控 A）
+hive --as B               # 以侦察身份独立启动；会话挂在 solo#B 上，可以续
+hive --as C --continue    # 续 C 上一次的独立会话
+hive run "3*7 等于几"      # 单轮，适合脚本
+hive doctor               # 环境自检（账本、策略、工具 schema 字符数）
 ```
 
-会话里：
+---
+
+## 四条设计约束
+
+前三条不是审美，是钱的形状决定的；第 4 条是 v3 对第 3 条的修正。
+
+1. **system 前缀逐字节不变** —— 前缀一变，后面整段历史全部作废，等于每轮重付全价。
+   `STABLE_PREFIX`（`src/core/prompt.ts`）改一个字符就要付一次「全盘作废税」，所以它**不进对话历史**，每轮临时拼在最前面。
+2. **角色挂在用户消息末尾** —— 切模块只换尾部那几十 token，而最末尾那段本来就在「必然未命中」的尾巴里，边际成本 ≈ 0。
+   反过来做（每个角色一份完整 system prompt）换一次角色就是整段历史作废。
+3. **权限收在执行层** —— 模型「答应不做」不算数，代码挡住才算数。
+4. **（v3 修正）工具 schema 按 agent 分套** —— 缓存单位从「全局一套工具」改为「**每个 agent 一套**」：
+   各 agent 各自冷启动一次、互不影响；加一个能力只作废装了它的那些 agent。不同 agent 本就是不同产品。
+
+---
+
+## 八个工具，按身份装配
+
+工具不写死在模块表里，而由 capability 声明式装配（`AGENTS[i].capabilities` → 该身份的工具集）。
+**装了 ≠ 准干** —— 能不能用由能力网关判（下一节）。
+
+| capability | 工具 | 说明 |
+|---|---|---|
+| `fs` | `read_file` `write_file` `edit_file` | `edit_file` 唯一匹配才动手，0 次/多次都拒绝并给出命中行号 |
+| `search` | `grep` `glob` | 正则搜内容 / 通配符列文件（不跟符号链接，带 200ms 正则软超时） |
+| `calc` | `calculator` | 无副作用，不进网关 |
+| `shell` | `bash` | **默认全拒**，见「沙箱」一节 |
+| `delegate` | `delegate` | 借调（令牌 + 预算闸门） |
+| `web` `skill` | — | 只声明，还没实现（贡献 0 token） |
+
+各身份每轮为工具 schema 付的钱（`/caps` 随时可查）：
+
+| 身份 | 工具数 | 字符/轮 |
+|---|---|---|
+| A 主控 | 8 | 2962 |
+| B 侦察 | 7 | 2719 |
+| C 修复 | 4 | 1312 |
+| D 审计 | 6 | 2109 |
+
+---
+
+## 沙箱：能力网关
+
+所有副作用走同一道门，两个判据缺一不可：
+
+- `AGENTS[by].capabilities` —— 谁**能**发起这类动作
+- 规则表 —— **这一次**准不准（默认 deny）
+
+规则从 `.hive/policy.json` 读，七个 `HIVE_POLICY_*` 环境变量可覆盖；**配置写坏就整份退回默认 deny**（绝不因为手滑而放行）。
+
+```jsonc
+{
+  "default": "deny",
+  "roots": ["."],                                        // fs / search 的作用域
+  "agents": {
+    "A": { "fs.read": "allow", "fs.write": "allow" },
+    "B": { "fs.read": "allow", "fs.write": "deny" }      // 装了 fs，但只给读
+  },
+  "exec": { "allowCommands": [] },                       // 命令白名单，默认空
+  "net":  { "allowDomains": [] },
+  "ignore": [".git", "node_modules", "dist", ".hive"]
+}
+```
+
+### `bash` 默认是跑不了的
+
+白名单为空，谁都跑不了。要放开就往 `exec.allowCommands` 里填 —— 支持细到前几个词：
+
+```jsonc
+"exec": { "allowCommands": ["git status", "node --version"] }
+// 写 "git"  = 整个 git 都放行
+// 写 "*"   = 不限（自担风险）
+```
+
+**不给 shell 执行**：`spawn` 直接跑命令，不走 `sh -c` —— 走 shell 的话白名单形同虚设（`ls; rm -rf /` 的第一个词是 `ls` 就被放行了）。
+代价是管道 `|`、重定向 `>`、通配符 `*` 都不支持。
+
+另外两件：**子进程只拿到一份最小环境**（`DEEPSEEK_API_KEY` 这类名字含 `KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL` 的一律抹掉，逃生舱 `HIVE_BASH_ENV_KEEP` 也过不了这层过滤）；路径判定**解析真实路径**（项目里的符号链接指向外面会被拒）。
+
+### 诚实说边界
+
+这是 L1：防的是「手滑 + 模型乱来 + 事后可查」，**不是防恶意**。
+
+- 信任一个命令 = 放开那个命令的全部能力。信任了 `node`，`node -e "…"` 就能读写任意文件、绕过网关的 `fs.write`
+- 被信任的命令能 `cat .env` 文件本身（env 清理堵的是「继承」，不是「读取」）
+- 所有检查都在同一个进程、同一个用户、同一份文件系统权限里，挡不住「agent 自己写脚本绕过」
+- 每一次放行与拒绝都落账（`tag='policy'`，`/policy log` 可查），但仅此而已
+
+真正的隔离（容器 / 微虚拟机）在产品化清单上。
+
+---
+
+## 多 agent：A 主 + B/C/D 副，每个都能单独启动
+
+| 身份 | 角色 | 主模块 | 可借调 | 单独启动 |
+|---|---|---|---|---|
+| A | 主控：持会话、精简、再分配 | `assistant` | B / C / D | `hive --as A` |
+| B | 侦察：只陈列事实 | `recon` | C / D | `hive --as B` |
+| C | 修复：按目标改文件 | `fix` | — | `hive --as C` |
+| D | 审计：复核结论与事实 | `audit` | — | `hive --as D` |
+
+- **借调可嵌套**（A→B→C）。副 agent 拿不到调用方的历史 —— 子会话是独立 thread，物理隔离而非提示词叮嘱
+- **结构化交接**：只传 `{goal, slice, expect, budget}`，schema 里没有「原文」入口
+- **令牌**：A 借调时自动签发，`/grant` 可手动收紧；校验拦在执行层，模型看不到也绕不过
+- **独立会话**：挂 `solo#<身份>`，留 checkpoint，可以 `--continue` 接着聊
+- **模块栈**：`/use` 压栈、`/pop` 弹栈，借调结束回到原角色（栈式恢复，不是覆盖）
+
+---
+
+## 一道轮内的两道护栏 + 自动压缩
+
+- **工具批数上限 16**（`HIVE_TOOL_STEPS`，0 = 不限）：到顶就**安静结束本轮**，而不是让模型继续试
+- **token 闸门 20000**（`HIVE_TURN_BUDGET`，0 = 不封顶）：闸门在 `callModel` **之前**，超了不发请求
+
+两者触发时都会打一句「说『继续』就接着跑」。长任务的正常姿势是**多轮推进**：每轮是一笔可核对的消费，而不是一个越来越大的黑洞。
+
+历史太长会**自动压缩**：默认以上一轮的真实入 token 为尺子（超 24000 压一次），保留最近 16 条（且切点对齐到用户消息边界），丢掉的部分压成一条要点摘要。压缩改的是 prompt 中段，所以它必然付一次前缀重算 —— 这是刻意的取舍，发生时 UI 会明说。
+
+---
+
+## 命令（26 个）
 
 | 命令 | 作用 |
 |---|---|
 | `/cost` | 账单：本轮 / 会话 / 今日 / 历史 |
-| `/turn` | 本会话逐轮消耗一览 |
-| `/turn 3` | 第 3 轮明细 |
-| `/turn 2-5` | 第 2~5 轮合计 ← **查某聊天段花了多少** |
+| `/turn` `/turn 3` `/turn 2-5` | 本会话逐轮 / 单轮明细 / **某段合计** |
 | `/find 关键词` | 跨历史搜轮次 |
-| `/modules` · `/use <id>` | 列模块 / 切模块（压栈） |
-| `/stack` · `/pop` | 看模块栈 / 弹一层（借调结束回到原角色） |
-| `/as A\|B\|C\|D` | 切身份（压入该 agent 的主模块） |
-| `/delegate <身份> <目标>` | 把任务交给另一个身份（令牌 + 预算闸门 + 独立 thread） |
-| `/grant <身份> <预算>` | 签发借调令牌（默认自动签发之外的收紧手段） |
-| `/handoffs [n]` | 交接记录：谁把什么交给了谁、花了多少 |
-| `/budget` | 本会话令牌与预算余额 |
-| `/tail on\|off` | 尾部角色片开关（关掉做 A/B 对照） |
-| `/status on\|off` | 底部状态行开关 |
-| `/new` | 开新会话（冷缓存） |
-| `/history` | 存档点 |
-| `/help` | 全部命令 |
-| `/anatomy` `/misscheck` `/lenstat` `/ledger` `/thinktest` | 诊断（默认不列在 help 里，`/help all` 看） |
+| `/caps` | 各身份装了什么能力（工具 schema 字符数） |
+| `/policy` `/policy log` | 当前生效规则 / 最近的判罚（放行与拒绝都记） |
+| `/modules` `/use <id>` | 列模块 / 切模块（压栈） |
+| `/stack` `/pop` | 看模块栈 / 弹一层 |
+| `/as A\|B\|C\|D` | 切身份（调试用） |
+| `/delegate <身份> <目标>` | 把任务交给另一个身份 |
+| `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录 |
+| `/tail on\|off` `/status on\|off` | 尾部角色片开关 / 底部状态行开关 |
+| `/new` `/history` | 开新会话（冷缓存） / 存档点 |
+| `/anatomy` `/misscheck` `/lenstat` `/ledger` `/thinktest` | 诊断类（`/help all` 才列） |
 
-底部常驻一行：
+底部常驻一行，宽度不够从右往左丢段、绝不换行：
 
 ```
-hive · deepseek-flash · 谷 · 通用+尾 │ 本轮 $0.000043 思考32% k=2 │ 会话 $0.0012/12轮 均118出 │ 上下文 7.4k 命中92% │ 历史 $0.0056 41行 │ 栈 A›B
+本轮 $0.000043 思考32% 拒1 k=2 │ 上下文 7.4k 命中92% │ 会话 $0.0012 12轮 均$0.0001/轮 │ hive · deepseek-flash · 谷 · 通用+尾 │ 历史 $0.0056 41行
 ```
 
-宽度不够就自动丢右边的段（栈段最先丢），绝不换行。账单细节一律藏在命令里。
+---
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | 必填 |
+| `DEEPSEEK_API_KEY` | — | **必填** |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 需能在 `src/core/cost.ts` 的 `PRICE` 里找到 |
-| `HIVE_MAX_OUT` | `0` | 输出封顶，0 = 不封顶（**实测封顶只会切断答案，省不了钱**） |
-| `HIVE_LEDGER` | `.hive/costs.db` | 账本 |
+| `HIVE_TOOL_STEPS` | `16` | 一次 `run()` 内工具批数上限，0 = 不限 |
+| `HIVE_TURN_BUDGET` | `20000` | 一轮 token 闸门，0 = 不封顶 |
+| `HIVE_COMPRESS_AT` | `24000` | 上一轮入 token 超它才压缩，0 = 从不压 |
+| `HIVE_COMPRESS_KEEP` | `16` | 压缩后保留最近多少条消息 |
+| `HIVE_POLICY` | `.hive/policy.json` | 策略文件路径 |
+| `HIVE_POLICY_DEFAULT` / `_ROOTS` / `_READ` / `_WRITE` / `_EXEC` / `_NET` | — | 覆盖策略（`READ`/`WRITE`/`EXEC`/`NET` 是**白名单**语义：列出的允许，其余收回） |
+| `HIVE_BASH_ENV_KEEP` | 空 | 额外透传给子进程的变量名（仍过敏感词过滤） |
+| `HIVE_MAX_OUT` | `0` | 输出封顶（**实测封顶只会切断答案，省不了钱**） |
+| `HIVE_LEDGER` | `costs.db` | 账本路径（默认在工作目录） |
 | `HIVE_MEMORY` | `.hive/memory.db` | langgraph checkpoint |
 
 ## 账本
 
-`node:sqlite`（Node 内置，零外部依赖）。表结构与阶段 6.7 的 `costs.db` 对齐，
-**能直接读你 Python 版留下的历史账**：
+`node:sqlite`（Node 内置，零外部依赖）。表结构与早期 Python 版对齐，**能直接读那批历史账**：
 
 ```sql
 ledger(ts, day, run_id, thread_id, model, band, tag, module, calls,
        in_tok, cache_hit, out_tok, reason_tok, user_chars,
        user_head, out_head, cost_usd, style_on,
-       agent, task_id, budget_tok, budget_hit)
+       agent, task_id, budget_tok, budget_hit,
+       target, verdict, reason)        -- v3：能力网关的判罚行（tag='policy'）
 ```
 
-v2 又加了两张表：`tokens`（授权令牌）与 `handoffs`（交接记录）。
+另外三张表：`tokens`（授权令牌）、`handoffs`（交接记录）。
 
-`/misscheck` 会逐对检查几何律是否仍然成立于你的真实数据上 —— 这是唯一能证明
-「前缀缓存真的命中了」的手段，比任何猜测都硬。
+`/misscheck` 会逐对检查几何律在你的真实数据上是否仍然成立 —— 这是唯一能证明「前缀缓存真的命中了」的手段，比任何猜测都硬。
 
 ## 开发
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm test            # node --test（测试文件自带 tsx loader）
+npm test            # node --test（自带 tsx loader）
 npm run build       # 产物在 dist/
+npm run dev         # 直接跑 src/cli.ts
 ```
+
+测试全部零 API（假模型 / 临时目录 / 纯函数），所以改代码不必花一分钱。
 
 ## 路线图
 
-v0.1（骨架）与 v2 的 M1/M2 都已落地：
+- [x] v0.1 缓存友好前缀 + 尾部角色槽位 + token 账本 + 几何律检验
+- [x] v2 多 agent：令牌、结构化交接、模块栈、预算闸门、思考分级
+- [x] v3 M1 agent 一等公民：`hive --as`、独立可续会话
+- [x] v3 M2 capability 层 + 能力网关（L1 policy）+ 判罚落账
+- [x] v3 M2.5 实用化四件：`edit_file`、循环护栏、上下文压缩、`bash`
+- [x] v3 M2.6 沙箱加固：子进程 env 最小化、路径解析真实路径
+- [ ] v3 M3 A→B 往返（子会话可续）、并行借调、按 agent 核账
+- [ ] 以后：`web` / MCP / skill / 多 provider；容器级隔离
 
-- [x] 缓存友好前缀 + 尾部模块槽位
-- [x] 执行层权限（模块白名单）
-- [x] token 账本 + 几何律检验
-- [x] 底部状态行 / 命令面板
-- [x] 主 agent A 独占工作记忆，副 agent 无状态、只拿任务切片
-- [x] 结构化交接（schema 化的 handoff，不传原文）
-- [x] 授权通道：B 借调 C/D 需先取得 A 签发的令牌 → 子任务带预算闸门
-- [x] 模块栈：借调结束后回到原角色（栈式恢复，不是覆盖）
-- [x] 工具一次加齐（`write_file` / `delegate`，一次性前缀税）
-- [x] 思考预算按任务分级（查表类关思考、审计类放开）—— `/thinktest` 实测开关为 `thinking.type=disabled`，映射见 `think.ts` 的 `THINK_KWARGS`
-
-M3（真机）：A→B→C 借调跑一轮，核账 —— 命中率有没有掉、思考占比多少。
-`/thinktest` 已跑出结论（`thinking.type=disabled` 把思考打到 0），模块分级已接上。
+设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN）。
 
 ## License
 

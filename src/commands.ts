@@ -723,7 +723,7 @@ export const COMMANDS: Command[] = [
       ctx.out();
       const only = declaredOnly();
       if (only.length) {
-        ctx.out(dim(`  声明了但 M2 未实现（贡献 0 工具、0 token）：${only.join(' / ')}`));
+        ctx.out(dim(`  声明了但还没实现（贡献 0 工具、0 token）：${only.join(' / ')}`));
       }
       ctx.out(dim('  装了 write_file ≠ 能写 —— 判定归能力网关，看 /policy。'));
       ctx.out();
