@@ -18,7 +18,7 @@ import { runInNewContext } from 'node:vm';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 
-import { ignoreOf, loadPolicy, rootsOf, withinRoots } from './policy.js';
+import { ignoreOf, loadPolicy, rootsOf, withinRootsReal } from './policy.js';
 
 /** 上限 —— 见 §4.2 */
 export const GREP_MAX_LINES = 40;
@@ -136,8 +136,8 @@ function scopeRoots(sub?: string): string[] | string {
   const { spec } = loadPolicy();
   if (!sub || !sub.trim() || sub === '.' || sub === './') return rootsOf(spec);
   const target = resolve(process.cwd(), sub);
-  if (!withinRoots(target, spec)) {
-    return `ERROR: 越界，只能看 ${spec.roots.join(', ')} 之内`;
+  if (!withinRootsReal(target, spec).ok) {
+    return `ERROR: 越界，只能看 ${spec.roots.join(', ')} 之内（符号链接也算）`;
   }
   return [target];
 }

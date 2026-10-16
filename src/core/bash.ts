@@ -17,7 +17,10 @@ import { spawn } from 'node:child_process';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 
-import { commandBase, currentSpec, rootsOf } from './policy.js';
+import { commandAllowed, currentSpec, rootsReal, splitCommand } from './policy.js';
+
+// 命令解析与白名单判定住在 policy.ts（网关与工具层共用一份语义），这里只做转发
+export { commandBase, commandAllowed, splitCommand } from './policy.js';
 
 export const BASH_TIMEOUT_MS = 10_000;
 export const BASH_TIMEOUT_MAX_MS = 30_000;
@@ -33,65 +36,72 @@ export interface BashResult {
 }
 
 /**
- * 把命令行切成 `[bin, ...args]`。支持单双引号（引号内不被空格切开），
- * 不支持转义、变量展开、管道、重定向 —— 那些都需要 shell，而我们不给 shell。
+ * v3 M2.6：子进程的**最小环境**。
+ *
+ * 起因很直接：`spawn` 不传 `env` 就是继承整个 `process.env`，而 `cli.ts` 用
+ * `loadEnvFile()` 把 `.env` 读进来了 —— 于是任何被放行的命令只要 `env` 一下，
+ * `DEEPSEEK_API_KEY` 就被打印出来了。那是我们主动把钥匙递过去。
+ *
+ * 这**不**阻止被信任的命令去读它本来就有权读的文件（`.env` 文件还在磁盘上）——
+ * 它堵的是「继承」这一条。真正的隔离是 L3。
  */
-export function splitCommand(command: string): { bin: string; args: string[] } {
-  const parts: string[] = [];
-  let cur = '';
-  let quote: '"' | "'" | null = null;
-  let started = false;
+export const BASH_ENV_KEEP = [
+  'PATH',
+  'PATHEXT',
+  'SystemRoot',
+  'windir',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'HOME',
+  'USERPROFILE',
+  'LANG',
+  'LC_ALL',
+  'TZ',
+  'SHELL',
+  'USER',
+];
 
-  for (const ch of command.trim()) {
-    if (quote) {
-      if (ch === quote) {
-        quote = null;
-        continue;
-      }
-      cur += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      started = true;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (started || cur) {
-        parts.push(cur);
-        cur = '';
-        started = false;
-      }
-      continue;
-    }
-    cur += ch;
-    started = true;
-  }
-  if (started || cur) parts.push(cur);
+/** 双保险：名字里带这些词的一律不给 —— 逃生舱也过不了这一层（刻意的） */
+export const BASH_ENV_DENY = /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
 
-  const [bin = '', ...args] = parts;
-  return { bin, args };
+/** 逃生舱：`HIVE_BASH_ENV_KEEP=GOPATH,JAVA_HOME`（显式列出才透传，且仍过敏感词过滤） */
+export function envKeepList(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env['HIVE_BASH_ENV_KEEP'] ?? '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-/** 白名单判定：`"*"` 表示不限（自担风险），否则按命令 basename 精确比对 */
-export function commandAllowed(
-  command: string,
-  allow: string[],
-): { ok: boolean; base: string } {
-  const base = commandBase(command);
-  return { ok: allow.includes('*') || allow.includes(base), base };
+export function childEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  extra: string[] = envKeepList(env),
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of [...BASH_ENV_KEEP, ...extra]) {
+    if (BASH_ENV_DENY.test(name)) continue;
+    const v = env[name];
+    if (typeof v === 'string') out[name] = v;
+  }
+  return out;
 }
 
 /** 跑一条命令。超时用 SIGKILL 杀，输出按上限截断 —— 绝不让一次调用把进程拖死 */
 export function runCommand(
   bin: string,
   args: string[],
-  opts: { cwd: string; timeoutMs: number },
+  opts: { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv },
 ): Promise<BashResult> {
   return new Promise((done) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(bin, args, { cwd: opts.cwd, shell: false, windowsHide: true });
+      child = spawn(bin, args, {
+        cwd: opts.cwd,
+        shell: false,
+        windowsHide: true,
+        // v3 M2.6：显式给一份最小环境，不再继承整份 process.env
+        env: opts.env ?? childEnv(),
+      });
     } catch (e) {
       done({
         code: null,
@@ -168,9 +178,10 @@ export const bashTool = tool(
 
     const asked = Math.trunc(timeout_ms ?? BASH_TIMEOUT_MS);
     const timeoutMs = Math.min(Math.max(asked, 100), BASH_TIMEOUT_MAX_MS);
-    const cwd = rootsOf()[0] ?? process.cwd();
+    // cwd 也走真实路径：roots 本身可能是链接
+    const cwd = rootsReal()[0] ?? process.cwd();
 
-    const r = await runCommand(bin, args, { cwd, timeoutMs });
+    const r = await runCommand(bin, args, { cwd, timeoutMs, env: childEnv() });
 
     const parts: string[] = [];
     if (r.stdout) parts.push(r.stdout.trimEnd());

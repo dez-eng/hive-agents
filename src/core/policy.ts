@@ -14,8 +14,8 @@
  * 这是 L1：进程内的路径检查 + 白名单。挡不住符号链接，也挡不住 agent
  * 自己写脚本绕过 —— 那是 M3 的 L2（子进程 + 环境隔离）要管的。
  */
-import { readFileSync } from 'node:fs';
-import { delimiter, isAbsolute, resolve, sep } from 'node:path';
+import { readFileSync, realpathSync } from 'node:fs';
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import { AGENTS, mayDelegate, type AgentId, type CapabilityId } from './modules.js';
 
@@ -264,10 +264,160 @@ export function withinRoots(target: string, spec: PolicySpec = currentSpec(), cw
   return false;
 }
 
+// ── v3 M2.6：解析真实路径之后再判（挡符号链接穿透）──────────────
+
+/** Windows 上同一文件可能写成 D:\x 与 d:\x，比较要大小写不敏感 */
+const CASE_INSENSITIVE = process.platform === 'win32';
+
+function normPath(p: string): string {
+  let s = p;
+  if (s.startsWith('\\\\?\\')) s = s.slice(4); // 长路径前缀
+  return CASE_INSENSITIVE ? s.toLowerCase() : s;
+}
+
+function insidePath(child: string, parent: string): boolean {
+  const c = normPath(child);
+  const p = normPath(parent);
+  return c === p || c.startsWith(p.endsWith(sep) ? p : p + sep);
+}
+
+/**
+ * 把路径解成**真实路径**。`resolved === false` 表示解析不出来（目录不存在 / 没权限）
+ * —— 调用方按**拒绝**处理（保守侧）。
+ *
+ * 目标还不存在（准备新建）是常见情况：这时解析它的父目录，再拼回基名。
+ */
+export function realPathOf(abs: string): { path: string; resolved: boolean } {
+  try {
+    return { path: realpathSync(abs), resolved: true };
+  } catch {
+    /* 不存在或读不到，退一步解析父目录 */
+  }
+  try {
+    return { path: join(realpathSync(dirname(abs)), basename(abs)), resolved: true };
+  } catch {
+    return { path: abs, resolved: false };
+  }
+}
+
+/** roots 的真实路径（cwd 或 roots 自身可能就是链接） */
+export function rootsReal(spec: PolicySpec = currentSpec(), cwd = process.cwd()): string[] {
+  return spec.roots.map((r) => realPathOf(resolve(cwd, r)).path);
+}
+
+export interface RealCheck {
+  ok: boolean;
+  /** 解析后的真实路径（进错误信息，也便于调试） */
+  real: string;
+}
+
+/**
+ * v3 M2.6：**解析真实路径之后**再判在不在 roots 内 —— 挡住「项目里的链接指向外面」。
+ * 语义是「解析后仍在 roots 内就放行」：指向仓库内部的链接（monorepo 常见）照常可用。
+ *
+ * 网关判定与工具层兜底都走这一个函数，保证**同源**。
+ */
+export function withinRootsReal(
+  target: string,
+  spec: PolicySpec = currentSpec(),
+  cwd = process.cwd(),
+): RealCheck {
+  const abs = isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+  const { path: real, resolved } = realPathOf(abs);
+  if (!resolved) return { ok: false, real };
+  for (const root of rootsReal(spec, cwd)) {
+    if (insidePath(real, root)) return { ok: true, real };
+  }
+  return { ok: false, real };
+}
+
 /** 命令的第一个词（去掉路径）—— exec 白名单按它比对；bash.ts 也用这个，保证只有一份语义 */
 export function commandBase(command: string): string {
   const first = command.trim().split(/\s+/)[0] ?? '';
   return first.split(/[\\/]/).pop() ?? first;
+}
+
+/**
+ * 把命令行切成 `[bin, ...args]`。**「不给 shell」的前提就是这个函数**：
+ * 支持单双引号（引号内不被空格切开），不支持转义 / 变量展开 / 管道 / 重定向 ——
+ * 那些都要 shell，而我们不给。
+ */
+export function splitCommand(command: string): { bin: string; args: string[] } {
+  const parts: string[] = [];
+  let cur = '';
+  let quote: '"' | "'" | null = null;
+  let started = false;
+
+  for (const ch of command.trim()) {
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started || cur) {
+        parts.push(cur);
+        cur = '';
+        started = false;
+      }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started || cur) parts.push(cur);
+
+  const [bin = '', ...args] = parts;
+  return { bin, args };
+}
+
+/**
+ * 白名单判定（M2.6 拍板）：**命令前 N 个词前缀精确匹配**。
+ *
+ * ```
+ * "git"         → 任何 git 子命令都放行
+ * "git status"  → 只有以 git status 开头的命令
+ * "*"           → 不限（自担风险）
+ * ```
+ * 白名单项的第一词也按 basename 归一化，所以写 `/usr/bin/git` 与 `git` 等价。
+ */
+export function commandAllowed(
+  command: string,
+  allow: string[],
+): { ok: boolean; base: string; matched?: string } {
+  const { bin, args } = splitCommand(command);
+  const base = bin.split(/[\\/]/).pop() ?? bin;
+  const words = [base, ...args];
+
+  for (const rawItem of allow) {
+    const item = rawItem.trim();
+    if (!item) continue;
+    if (item === '*') return { ok: true, base, matched: '*' };
+
+    const want = item.split(/\s+/).filter(Boolean);
+    if (!want.length) continue;
+    const head = want[0]!.split(/[\\/]/).pop() ?? want[0]!;
+    const need = [head, ...want.slice(1)];
+
+    if (need.length > words.length) continue;
+    let hit = true;
+    for (let i = 0; i < need.length; i += 1) {
+      if (need[i] !== words[i]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return { ok: true, base, matched: item };
+  }
+  return { ok: false, base };
 }
 
 function verdict(allow: boolean, code: VerdictCode, reason: string, rule: string): Verdict {
@@ -308,11 +458,13 @@ export function checkAction(a: Action, spec: PolicySpec = currentSpec()): Verdic
   }
 
   if (a.kind === 'fs.read' || a.kind === 'fs.write') {
-    if (!withinRoots(a.target, spec)) {
+    // v3 M2.6：与工具层兜底同源 —— 都解析真实路径再比，符号链接穿透在这一层就被拒
+    const check = withinRootsReal(a.target, spec);
+    if (!check.ok) {
       return verdict(
         false,
         'out-of-roots',
-        `${a.target} 在 roots（${spec.roots.join(', ')}）之外`,
+        `${a.target} 在 roots（${spec.roots.join(', ')}）之外（解析后：${check.real}）`,
         'roots',
       );
     }
@@ -337,14 +489,14 @@ export function checkAction(a: Action, spec: PolicySpec = currentSpec()): Verdic
   }
 
   if (a.kind === 'exec') {
-    const allow = spec.exec.allowCommands;
-    const base = commandBase(a.target);
-    // "*" = 不限（自担风险）；否则按 basename 精确比对 —— 正因为不给 shell，这么判才成立
-    if (!allow.includes('*') && !allow.includes(base)) {
+    // "*" = 不限（自担风险）；否则按「命令前 N 个词前缀精确匹配」——
+    // 白名单可以只写 "git"，也可以细到 "git status"
+    const v = commandAllowed(a.target, spec.exec.allowCommands);
+    if (!v.ok) {
       return verdict(
         false,
         'denied',
-        `命令 ${base} 不在 exec.allowCommands 里（要放开就加 "${base}"，或写 "*" 表示不限）`,
+        `命令 ${v.base} 不在 exec.allowCommands 里（要放开就加 "${v.base}"，或写 "*" 表示不限）`,
         'exec.allowCommands',
       );
     }

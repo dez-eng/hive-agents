@@ -16,7 +16,7 @@ import { z } from 'zod';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-import { withinRoots } from './policy.js';
+import { withinRootsReal } from './policy.js';
 
 /**
  * 一次读取的上限。4,000 字符 ≈ 1,300 token，
@@ -53,9 +53,10 @@ export const calculator = tool(
 export const readFileTool = tool(
   async ({ path }: { path: string }): Promise<string> => {
     const target = resolve(process.cwd(), path);
-    // 兜底：真正的判定在网关；这里只保证「无论谁调，都出不了 roots」
-    if (!withinRoots(target)) {
-      return 'ERROR: 越界，只能读 roots（当前策略）内的文件';
+    // 兜底：真正的判定在网关；这里只保证「无论谁调，都出不了 roots」。
+    // v3 M2.6 起解析真实路径 —— 项目里的符号链接指向外面也挡得住。
+    if (!withinRootsReal(target).ok) {
+      return 'ERROR: 越界：解析真实路径后仍在 roots（当前策略）之外（符号链接也算）';
     }
     try {
       if (!statSync(target).isFile()) return `ERROR: 不是文件 ${path}`;
@@ -74,8 +75,8 @@ export const readFileTool = tool(
 export const writeFileTool = tool(
   async ({ path, content }: { path: string; content: string }): Promise<string> => {
     const target = resolve(process.cwd(), path);
-    if (!withinRoots(target)) {
-      return 'ERROR: 越界，只能写 roots（当前策略）内的文件';
+    if (!withinRootsReal(target).ok) {
+      return 'ERROR: 越界：解析真实路径后仍在 roots（当前策略）之外（符号链接也算）';
     }
     try {
       mkdirSync(dirname(target), { recursive: true });
@@ -115,8 +116,8 @@ export const editFileTool = tool(
     replace_all?: boolean;
   }): Promise<string> => {
     const target = resolve(process.cwd(), path);
-    if (!withinRoots(target)) {
-      return 'ERROR: 越界，只能改 roots（当前策略）内的文件';
+    if (!withinRootsReal(target).ok) {
+      return 'ERROR: 越界：解析真实路径后仍在 roots（当前策略）之外（符号链接也算）';
     }
 
     let text: string;

@@ -24,14 +24,18 @@ test('splitCommand：按空格切；引号内不切，引号被剥掉', () => {
   assert.deepEqual(splitCommand("node -e 'a b'"), { bin: 'node', args: ['-e', 'a b'] });
 });
 
-test('白名单按 basename 比；"*" 表示不限；借壳（bash -c）也挡得住', () => {
+test('白名单前缀精确匹配；"*" 表示不限；借壳（bash -c）也挡得住', () => {
   assert.equal(commandBase('/usr/bin/ls -la'), 'ls');
   assert.equal(commandBase('C:\\Windows\\node.exe -v'), 'node.exe');
-  assert.deepEqual(commandAllowed('ls -la', ['ls']), { ok: true, base: 'ls' });
+  assert.deepEqual(commandAllowed('ls -la', ['ls']), { ok: true, base: 'ls', matched: 'ls' });
   assert.equal(commandAllowed('rm -rf /', ['ls']).ok, false);
   assert.equal(commandAllowed('rm -rf /', ['*']).ok, true);
   assert.equal(commandAllowed('bash -c "ls"', ['ls']).ok, false, '白名单里没有 bash 就不许借壳');
   assert.equal(commandAllowed('sh -c "ls"', ['ls', 'node']).ok, false);
+  // v3 M2.6：两词形式 —— 前缀精确匹配
+  assert.equal(commandAllowed('git status --short', ['git status']).ok, true);
+  assert.equal(commandAllowed('git push origin main', ['git status']).ok, false);
+  assert.equal(commandAllowed('git status', ['git']).ok, true, '只写一个词 = 该命令全都放行');
 });
 
 test('白名单外：工具层直接拒（网关之外的第二道）', async () => {
