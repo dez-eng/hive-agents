@@ -410,7 +410,9 @@ export class HiveAgent {
     const sentContent = renderUserContent(req.text, req.module, { tail: req.tail });
 
     const saved = this.graph.getRuntime();
-    this.graph.setRuntime({
+    // 持有本轮 runtime 的引用：finally 会把 graph 上的 runtime 恢复成上一轮，
+    // 靠 getRuntime() 事后读会读到旧值（denied 永远是 0）—— 所以直接读这个对象
+    const rt = {
       meter,
       budgetTokens: req.budgetTokens ?? 0,
       delegate: req.delegate ?? null,
@@ -420,7 +422,8 @@ export class HiveAgent {
       threadId: req.threadId,
       ...(req.taskId ? { taskId: req.taskId } : {}),
       denied: 0,
-    });
+    };
+    this.graph.setRuntime(rt);
 
     const config = {
       configurable: { thread_id: req.threadId },
@@ -444,21 +447,14 @@ export class HiveAgent {
       }
     } catch (e) {
       if (isBudgetExceeded(e)) {
-        return {
-          text,
-          sentContent,
-          meter,
-          budgetHit: true,
-          denied: this.graph.getRuntime().denied,
-        };
+        return { text, sentContent, meter, budgetHit: true, denied: rt.denied };
       }
       throw e;
     } finally {
       this.graph.setRuntime(saved);
     }
 
-    // 注意：return 的表达式在 finally 之前求值 —— 这里读到的还是本轮 runtime
-    return { text, sentContent, meter, budgetHit: false, denied: this.graph.getRuntime().denied };
+    return { text, sentContent, meter, budgetHit: false, denied: rt.denied };
   }
 
   async history(threadId: string): Promise<BaseMessage[]> {

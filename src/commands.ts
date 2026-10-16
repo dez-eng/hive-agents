@@ -468,9 +468,11 @@ export const COMMANDS: Command[] = [
     async run(ctx) {
       const thread = Math.random().toString(16).slice(2, 10);
       ctx.state.thread = thread;
-      // 新会话 = 冷缓存；模块栈也一并回到主控 —— 借调状态不该跨会话残留
-      ctx.state.stack = [DEFAULT_MODULE];
-      ctx.out(`[已开新会话 thread_id=${thread} · 模块栈已回到 ${DEFAULT_MODULE}]`);
+      // 新会话 = 冷缓存；模块栈回到**本会话的根身份**（不是硬编码 A）——
+      // 独立会话（--as D）清会话不该把自己升成 A
+      const home = getAgent(ctx.state.rootAgent)?.home ?? DEFAULT_MODULE;
+      ctx.state.stack = [home];
+      ctx.out(`[已开新会话 thread_id=${thread} · 模块栈已回到 ${home}（身份 ${ctx.state.rootAgent}）]`);
       ctx.out(dim('  冷缓存：下一轮整段 prompt 都要按全价未命中付一次。'));
       ctx.out(dim('  好处是历史清空，风格与模块的影响变干净。\n'));
     },

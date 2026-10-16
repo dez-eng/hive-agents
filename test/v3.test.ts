@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 
 import { AGENTS, standaloneAgents, getModule, type AgentId } from '../src/core/modules.js';
 import { soloThread, subThread } from '../src/core/handoff.js';
-import { newReplStateFor } from '../src/core/session.js';
+import { newReplState, newReplStateFor } from '../src/core/session.js';
 import { parse, resolveAs } from '../src/core/args.js';
 
 test('AGENTS：每个 agent 都有 capability、think 合法、可独立启动（全开）', () => {
@@ -40,6 +40,9 @@ test('newReplStateFor：栈底直接是该 agent 的主模块', () => {
   const st = newReplStateFor('solo#C', 'C');
   assert.deepEqual(st.stack, ['fix']);
   assert.equal(st.thread, 'solo#C');
+  // 根身份要记住：/new 靠它决定栈底回到谁（否则 D 的会话清一下就变成 A）
+  assert.equal(st.rootAgent, 'C');
+  assert.equal(newReplState('main').rootAgent, 'A');
   // 与普通会话不同：普通会话栈底是默认模块
   assert.deepEqual(newReplStateFor('solo#D', 'D').stack, ['audit']);
 });

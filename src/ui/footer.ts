@@ -50,6 +50,8 @@ function segments(f: FooterInput): string[] {
     out.push(
       `本轮 ${yellow(fmtUsd(m.cost()))}` +
         ` 思考${bold(String(share))}%` +
+        // 拒绝是异常信号，跟着「本轮」走（排最右会第一个被宽度丢掉）
+        (f.denied ? ` ${red(`拒${f.denied}`)}` : '') +
         (kk ? dim(` k=${kk.toFixed(0)}`) : '') +
         (m.truncated ? ` ${dim('截断')}` : ''),
     );
@@ -80,9 +82,6 @@ function segments(f: FooterInput): string[] {
   if (f.stack.length > 1) {
     out.push(`栈 ${f.stack.map((id) => agentOf(id) ?? '?').join('›')}`);
   }
-
-  // v3 M2：有拒绝时才出现，且排在最右（宽度不够第一个被丢）
-  if (f.denied) out.push(red(`拒 ${f.denied}`));
 
   return out;
 }

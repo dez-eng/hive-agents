@@ -14,6 +14,12 @@ import { stackTop } from './stack.js';
 export interface ReplState {
   /** 当前 thread_id —— 换会话就是换它，等于冷缓存 */
   thread: string;
+  /**
+   * v3 M2：本会话的**根身份**。独立会话（`hive --as D`）是 D，普通会话是 A。
+   * `/new` 靠它决定栈底回到谁 —— 否则「清会话」等于偷偷换了身份：
+   * D 的会话 `/new` 之后会变成 A，写权限就那么溜出来了（真机踩到过）。
+   */
+  rootAgent: AgentId;
   /** 模块栈。栈底是 A 的主模块，栈顶是当前执行者（v2 §2 栈式恢复） */
   stack: string[];
   /** 尾部角色片开关。关掉后跨模块切换同字节，用于 A/B */
@@ -31,6 +37,7 @@ export interface ReplState {
 export function newReplState(thread: string): ReplState {
   return {
     thread,
+    rootAgent: DEFAULT_AGENT,
     stack: [DEFAULT_MODULE],
     tail: true,
     footer: true,
@@ -46,6 +53,7 @@ export function newReplState(thread: string): ReplState {
  */
 export function newReplStateFor(thread: string, as: AgentId): ReplState {
   const st = newReplState(thread);
+  st.rootAgent = as;
   st.stack = [AGENTS[as].home];
   return st;
 }

@@ -84,6 +84,7 @@ async function main(): Promise<number> {
       );
       process.stdout.write('\n');
       ctx.state.lastTurn = res.meter;
+      ctx.state.lastDenied = res.denied;
       ctx.session.add(res.meter);
       ctx.ledger.insert({
         kind: 'turn',
