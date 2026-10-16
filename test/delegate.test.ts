@@ -18,7 +18,7 @@ import type { TurnRequest, TurnResult } from '../src/core/agent.js';
 import { TokenMeter } from '../src/core/meter.js';
 import { Ledger } from '../src/core/ledger.js';
 import { AGENTS, getModule } from '../src/core/modules.js';
-import { ALL_TOOLS, ROOT, TOOL_MAP } from '../src/core/tools.js';
+import { ALL_TOOLS, TOOL_MAP, toolNamesFor } from '../src/core/capability.js';
 import { issueToken, type Token } from '../src/core/grant.js';
 import type { TurnRunner } from '../src/core/subagent.js';
 
@@ -60,7 +60,7 @@ class FakeRunner implements TurnRunner {
     this.seen.push(req);
     const meter = new TokenMeter({ model: 'deepseek-flash' });
     meter.absorb({ calls: 1, inTok: 100, outTok: 20, cacheHit: 0, reasoning: 0 });
-    return { text: '改动完成：把比较改成 startsWith', sentContent: req.text, meter, budgetHit: false };
+    return { text: '改动完成：把比较改成 startsWith', sentContent: req.text, meter, budgetHit: false, denied: 0 };
   }
 }
 
@@ -72,19 +72,19 @@ function mkToken(to: 'B' | 'C' | 'D', budget = 500): Token {
 
 const DEL = { name: 'delegate', args: { to: 'C', goal: '修越界读', slice: 'a.ts:1 xx', expect: 'diff', budgetTokens: 200 }, id: 'd1' };
 
-test('工具一次加齐：write_file 与 delegate 都在 ALL_TOOLS（§7）', () => {
+test('工具注册表齐备：write_file 与 delegate 都在 ALL_TOOLS（v3：归 capability）', () => {
   const names = ALL_TOOLS.map((t) => t.name);
   assert.ok(names.includes('write_file'), 'write_file 该进 ALL_TOOLS');
   assert.ok(names.includes('delegate'), 'delegate 该进 ALL_TOOLS');
 });
 
-test('执行层白名单：A/B 开 delegate，C 开 write_file，C/D 不开 delegate，D 只读', () => {
-  assert.ok(getModule('assistant')!.tools.includes('delegate'));
-  assert.ok(getModule('recon')!.tools.includes('delegate'));
-  assert.ok(getModule('fix')!.tools.includes('write_file'));
-  assert.ok(!getModule('fix')!.tools.includes('delegate'), 'C 不借调谁');
-  assert.ok(!getModule('audit')!.tools.includes('write_file'));
-  assert.ok(!getModule('calc')!.tools.includes('delegate'));
+test('v3 M2：工具按**身份**装配（模块表不再管这个）', () => {
+  assert.ok(toolNamesFor('A').includes('delegate'));
+  assert.ok(toolNamesFor('B').includes('delegate'));
+  assert.ok(toolNamesFor('C').includes('write_file'));
+  assert.ok(!toolNamesFor('C').includes('delegate'), 'C 不借调谁');
+  assert.ok(!toolNamesFor('D').includes('delegate'), 'D 不借调谁');
+  assert.ok(!toolNamesFor('A').includes('bash'), 'M2 没有 shell capability 的工具');
 });
 
 test('delegate 工具直接 invoke 不干活 —— 真正执行在执行层', async () => {
@@ -99,7 +99,7 @@ test('write_file：能写项目内文件、挡越界', async () => {
   assert.ok(escape.includes('越界'));
 
   const rel = `.tmp-write-test-${process.pid}.txt`;
-  const abs = resolve(ROOT, rel);
+  const abs = resolve(process.cwd(), rel);
   try {
     const ok = String(await rf.invoke({ path: rel, content: 'hello hive' }));
     assert.ok(ok.startsWith('OK'), ok);
@@ -141,6 +141,7 @@ test('delegate 执行层：模型调 delegate → runSubagent 跑子任务 + 留
       module: getModule('recon')!, // B：开了 delegate
       tail: false,
       delegate,
+      agent: 'B', // v3 M2：这一轮是谁在跑（决定工具集与网关判据）
     });
 
     assert.equal(res.text, '已交给修复');
@@ -163,7 +164,7 @@ test('delegate 执行层：模型调 delegate → runSubagent 跑子任务 + 留
   }
 });
 
-test('执行层白名单：没开 delegate 的模块调它 → 被挡，子任务不跑', async () => {
+test('v3 M2：身份没装的能力，调它 → 被门挡住，子任务不跑', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'hive-del2-'));
   const led = new Ledger(join(dir, 't.db'));
   led.open();
@@ -175,7 +176,8 @@ test('执行层白名单：没开 delegate 的模块调它 → 被挡，子任�
     const delegate: DelegateContext = {
       ledger: led,
       thread: 'main',
-      from: 'A',
+      // v3 M2：判据是**身份**不是模块 —— D 的 capabilities 里没有 delegate
+      from: 'D',
       token: null,
       runner,
       moduleOf: (as) => getModule(AGENTS[as].home)!,
@@ -186,12 +188,13 @@ test('执行层白名单：没开 delegate 的模块调它 → 被挡，子任�
     await agent.run({
       text: '算一下',
       threadId: 'main',
-      module: getModule('calc')!, // calc 没开 delegate
+      module: getModule('audit')!, // D 的主模块（模块不再管工具了）
       tail: false,
       delegate,
+      agent: 'D',
     });
 
-    assert.equal(runner.seen.length, 0, '白名单没放行，子任务不该跑');
+    assert.equal(runner.seen.length, 0, 'D 没装 delegate 能力，子任务不该跑');
     assert.equal(led.recentHandoffs(1).length, 0);
   } finally {
     led.close();

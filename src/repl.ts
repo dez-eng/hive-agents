@@ -137,6 +137,9 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
         module: mod,
         tail: ctx.state.tail,
         delegate: makeDelegateContext(ctx),
+        // v3 M2：身份决定工具集与网关判据；账本给网关落判罚
+        agent: currentAgent(ctx.state),
+        ledger: ctx.ledger,
       },
       (piece) => {
         process.stdout.write(piece);
@@ -145,6 +148,7 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
     answer = res.text;
     ctx.state.lastTurn = res.meter;
     ctx.state.lastSent = res.sentContent;
+    ctx.state.lastDenied = res.denied;
     ctx.session.add(res.meter);
     if (answer === '') process.stdout.write(dim('（这轮没有可见输出，钱都花在思考上了）'));
     process.stdout.write('\n');

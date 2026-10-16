@@ -22,6 +22,8 @@ export interface ReplState {
   footer: boolean;
   /** 最近一轮的计量，footer 用 */
   lastTurn: TokenMeter | null;
+  /** v3 M2：最近一轮被能力网关拒了几次 —— footer 的「拒 N」 */
+  lastDenied: number;
   /** 最近一轮发的原文，/cost 里做对照 */
   lastSent: string;
 }
@@ -33,6 +35,7 @@ export function newReplState(thread: string): ReplState {
     tail: true,
     footer: true,
     lastTurn: null,
+    lastDenied: 0,
     lastSent: '',
   };
 }

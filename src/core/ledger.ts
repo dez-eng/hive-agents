@@ -62,6 +62,12 @@ export interface LedgerEntry {
   budgetTok?: number;
   /** v2：这一轮是否被预算闸门熔断（1 = 是） */
   budgetHit?: number;
+  /** v3 M2：policy 行的动作目标（文件路径 / 子任务目标身份） */
+  target?: string;
+  /** v3 M2：policy 行的判定 —— allow / deny / ask-pending */
+  verdict?: string;
+  /** v3 M2：policy 行命中的规则，或拒绝原因 */
+  reason?: string;
 }
 
 export interface LedgerRow {
@@ -88,6 +94,9 @@ export interface LedgerRow {
   taskId: string;
   budgetTok: number;
   budgetHit: number;
+  target: string;
+  verdict: string;
+  reason: string;
 }
 
 export interface LedgerTotals {
@@ -165,13 +174,16 @@ function mapRow(r: Record<string, unknown>): LedgerRow {
     taskId: str(r['task_id']),
     budgetTok: num(r['budget_tok']),
     budgetHit: num(r['budget_hit']),
+    target: str(r['target']),
+    verdict: str(r['verdict']),
+    reason: str(r['reason']),
   };
 }
 
 const COLUMNS =
   'id, ts, day, run_id, thread_id, model, band, tag, module, calls, in_tok, cache_hit,' +
   ' out_tok, reason_tok, cost_usd, user_chars, user_head, out_head, style_on,' +
-  ' agent, task_id, budget_tok, budget_hit';
+  ' agent, task_id, budget_tok, budget_hit, target, verdict, reason';
 
 /** 未命中 = 入 − 命中；余额 = 未命中 − (入 mod 64)；k = 余额 ÷ 64 */
 export function kBlocksOf(inTok: number, cacheHit: number): number {
@@ -251,7 +263,10 @@ export class Ledger {
           agent      TEXT    NOT NULL DEFAULT '',
           task_id    TEXT    NOT NULL DEFAULT '',
           budget_tok INTEGER NOT NULL DEFAULT 0,
-          budget_hit INTEGER NOT NULL DEFAULT 0
+          budget_hit INTEGER NOT NULL DEFAULT 0,
+          target     TEXT    NOT NULL DEFAULT '',
+          verdict    TEXT    NOT NULL DEFAULT '',
+          reason     TEXT    NOT NULL DEFAULT ''
         )
       `);
 
@@ -270,6 +285,10 @@ export class Ledger {
         ['task_id', "ALTER TABLE ledger ADD COLUMN task_id TEXT NOT NULL DEFAULT ''"],
         ['budget_tok', 'ALTER TABLE ledger ADD COLUMN budget_tok INTEGER NOT NULL DEFAULT 0'],
         ['budget_hit', 'ALTER TABLE ledger ADD COLUMN budget_hit INTEGER NOT NULL DEFAULT 0'],
+        // v3 M2：能力网关的判罚留痕（sqlite 的 ADD COLUMN 是 O(1)，旧行照读）
+        ['target', "ALTER TABLE ledger ADD COLUMN target TEXT NOT NULL DEFAULT ''"],
+        ['verdict', "ALTER TABLE ledger ADD COLUMN verdict TEXT NOT NULL DEFAULT ''"],
+        ['reason', "ALTER TABLE ledger ADD COLUMN reason TEXT NOT NULL DEFAULT ''"],
       ];
       for (const [col, ddl] of patches) {
         if (!cols.has(col)) db.exec(ddl);
@@ -341,8 +360,9 @@ export class Ledger {
       const stmt = this.db.prepare(
         'INSERT INTO ledger (ts, day, run_id, thread_id, model, band, tag, module,' +
           ' calls, in_tok, cache_hit, out_tok, reason_tok, user_chars, user_head,' +
-          ' out_head, cost_usd, style_on, agent, task_id, budget_tok, budget_hit)' +
-          ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          ' out_head, cost_usd, style_on, agent, task_id, budget_tok, budget_hit,' +
+          ' target, verdict, reason)' +
+          ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       );
       const res = stmt.run(
         at.toISOString().slice(0, 19),
@@ -367,11 +387,60 @@ export class Ledger {
         e.taskId ?? '',
         e.budgetTok ?? 0,
         e.budgetHit ?? 0,
+        e.target ?? '',
+        e.verdict ?? '',
+        e.reason ?? '',
       );
       const id = res.lastInsertRowid;
       return typeof id === 'number' ? id : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * v3 M2：能力网关的一次判定（放行与拒绝都记 —— V3-PLAN §4.2 第 4 条）。
+   * 它不花钱，也不参与任何 token 统计（查询都按 tag='turn' 过滤），
+   * 但它解释「钱能花在哪儿」——被拒的动作没进模型，等于没花钱。
+   */
+  insertPolicy(p: {
+    capability: string;
+    agent: string;
+    target: string;
+    verdict: string;
+    reason: string;
+    threadId?: string;
+    taskId?: string;
+  }): number | null {
+    return this.insert({
+      kind: 'policy',
+      threadId: p.threadId ?? '',
+      module: p.capability,
+      agent: p.agent,
+      calls: 0,
+      inTok: 0,
+      cacheHit: 0,
+      outTok: 0,
+      reasoning: 0,
+      costUsd: 0,
+      userHead: `${p.verdict} ${p.capability} ${p.target}`,
+      target: p.target,
+      verdict: p.verdict,
+      reason: p.reason,
+      ...(p.taskId ? { taskId: p.taskId } : {}),
+    });
+  }
+
+  /** 最近的判罚行（/policy log 用） */
+  recentPolicy(limit = 20): LedgerRow[] {
+    if (!this.db) return [];
+    try {
+      return this.db
+        .prepare(`SELECT ${COLUMNS} FROM ledger WHERE tag='policy' ORDER BY id DESC LIMIT ?`)
+        .all(limit)
+        .map(mapRow);
+    } catch {
+      return [];
     }
   }
 
@@ -461,7 +530,10 @@ export class Ledger {
   totals(scope: { day?: string; runId?: string; threadId?: string } = {}): LedgerTotals | null {
     if (!this.db) return null;
     try {
-      const where: string[] = [];
+      const where: string[] = [
+        // v3 M2：能力网关的判罚行不是消费 —— 它不能进任何账单统计
+        "tag <> 'policy'",
+      ];
       const args: unknown[] = [];
       if (scope.day) {
         where.push('day = ?');
@@ -505,7 +577,7 @@ export class Ledger {
           'SELECT day, COALESCE(SUM(calls),0) AS calls, COALESCE(SUM(in_tok),0) AS in_tok,' +
             ' COALESCE(SUM(cache_hit),0) AS cache_hit, COALESCE(SUM(out_tok),0) AS out_tok,' +
             ' COALESCE(SUM(reason_tok),0) AS reason_tok, COALESCE(SUM(cost_usd),0) AS cost_usd,' +
-            ' COUNT(*) AS rows FROM ledger GROUP BY day ORDER BY day DESC LIMIT ?',
+            " COUNT(*) AS rows FROM ledger WHERE tag <> 'policy' GROUP BY day ORDER BY day DESC LIMIT ?",
         )
         .all(limit)
         .map((r) => ({

@@ -23,7 +23,13 @@ import { THINK_CANDIDATES, pickThinkingOff, runThinkProbe, thinkVerdict } from '
 import { issueToken, remaining } from './core/grant.js';
 import { makeTaskId, type HandoffInput } from './core/handoff.js';
 import { runSubagent } from './core/subagent.js';
-import { ALL_TOOLS, ROOT, toolsChars } from './core/tools.js';
+import {
+  declaredOnly,
+  toolNamesFor,
+  toolsCharsFor,
+  toolsFor,
+} from './core/capability.js';
+import { ENV_KEYS, loadPolicy, policyPath } from './core/policy.js';
 import { bold, dim, fmtInt, fmtPct, fmtTok, fmtUsd, green, red, yellow } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
 
@@ -315,12 +321,14 @@ export const COMMANDS: Command[] = [
       );
       for (const m of moduleList()) {
         const mark = m.id === cur ? green('▸') : ' ';
+        const owner = m.owner ?? 'A';
         ctx.out(
           `${mark} ${m.id.padEnd(10)} ${m.title.padEnd(4)} ${dim(m.summary)}` +
-            `  ${dim(`[工具 ${m.tools.join(',') || '无'} · 思考 ${m.think}${m.owner ? ` · 归属 ${m.owner}` : ''}]`)}`,
+            `  ${dim(`[身份 ${owner} 的工具 ${toolNamesFor(owner).join(',') || '无'} · 思考 ${m.think}]`)}`,
         );
       }
       ctx.out();
+      ctx.out(dim('  工具归**身份**（/caps 看），模块只管角色片与思考档 ——「装了什么」不等于「准干什么」（/policy）。'));
       ctx.out(dim('  /use <id> 切模块（压栈）· /pop 弹回上一层 · /stack 看整条栈 · /as 切身份'));
       ctx.out();
     },
@@ -422,7 +430,7 @@ export const COMMANDS: Command[] = [
       const v = (args[0] ?? '').trim();
       if (v !== 'on' && v !== 'off') {
         ctx.out(`[尾部角色片当前 ${ctx.state.tail ? '开' : '关'}]`);
-        ctx.out(dim('  /tail off 后，模块仍生效于工具权限，但不再往 prompt 里写角色片。\n'));
+        ctx.out(dim('  /tail off 后，模块只影响思考档，不再往 prompt 里写角色片 —— 工具权限归身份，见 /caps。\n'));
         return;
       }
       ctx.state.tail = v === 'on';
@@ -493,14 +501,14 @@ export const COMMANDS: Command[] = [
       const hu = msgs.filter((m) => m.getType() === 'human');
       const aiChars = ai.reduce((n, m) => n + String(m.content).length, 0);
       const huChars = hu.reduce((n, m) => n + String(m.content).length, 0);
-      const toolChars = toolsChars();
+      const toolChars = toolsCharsFor(currentAgent(ctx.state));
       const tailChars = ctx.state.tail
         ? hu.length * (TAIL_MARK.length + moduleOf(currentModuleId(ctx.state)).fragment.length + 8)
         : 0;
       const total = STABLE_PREFIX.length + toolChars + aiChars + huChars;
       ctx.out(bold(`[Prompt 解剖 · thread=${ctx.state.thread} · 未含服务端模板开销]`));
       ctx.out(`  system 前缀（冻结区）     ${String(STABLE_PREFIX.length).padStart(7)} 字符`);
-      ctx.out(`  工具 schema（${ALL_TOOLS.length} 个）     ${String(toolChars).padStart(7)} 字符`);
+      ctx.out(`  工具 schema（身份 ${currentAgent(ctx.state)} · ${toolsFor(currentAgent(ctx.state)).length} 个）     ${String(toolChars).padStart(7)} 字符`);
       ctx.out(
         `  历史 ${String(msgs.length).padStart(2)} 条               ${String(aiChars + huChars).padStart(7)} 字符`,
       );
@@ -684,6 +692,92 @@ export const COMMANDS: Command[] = [
       }
       ctx.out();
       ctx.out(dim('  逐轮看 /turn   搜词看 /find   几何律看 /misscheck'));
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/caps',
+    usage: '/caps',
+    summary: '各身份装了什么能力（工具 schema 就是缓存前缀的一部分）',
+    async run(ctx) {
+      const me = currentAgent(ctx.state);
+      ctx.out(bold(`[capability · 当前身份 ${me} · 工具 schema 决定前缀缓存]`));
+      for (const a of Object.values(AGENTS)) {
+        const names = toolNamesFor(a.id);
+        ctx.out(
+          `  ${a.id === me ? green('▸') : ' '} ${a.id} ${a.title.padEnd(4)}` +
+            ` 装 ${dim(a.capabilities.join('/'))}` +
+            `  → 工具 ${names.join(',') || '（无）'}` +
+            dim(` · ${toolsCharsFor(a.id)} 字符/轮`),
+        );
+      }
+      ctx.out();
+      const only = declaredOnly();
+      if (only.length) {
+        ctx.out(dim(`  声明了但 M2 未实现（贡献 0 工具、0 token）：${only.join(' / ')}`));
+      }
+      ctx.out(dim('  装了 write_file ≠ 能写 —— 判定归能力网关，看 /policy。'));
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/policy',
+    usage: '/policy [log]',
+    summary: '能力网关：当前生效的规则 / 最近的判罚（放行与拒绝都记）',
+    async run(ctx, args) {
+      if ((args[0] ?? '').trim() === 'log') {
+        const rows = ctx.ledger.recentPolicy(20);
+        if (!rows.length) {
+          ctx.out(dim('[还没有判罚记录 —— 网关是 M2 才有的，更早的行为不留痕]\n'));
+          return;
+        }
+        ctx.out(bold(`[最近 ${rows.length} 条判定 · 新的在前 · 放行与拒绝都记]`));
+        for (const r of rows) {
+          const mark = r.verdict === 'allow' ? green('放行') : red(r.verdict || '拒绝');
+          ctx.out(
+            `  ${r.ts.slice(5, 19)}  ${mark.padEnd(14)} ${r.agent}→${r.module.padEnd(8)}` +
+              `  ${head(r.target, 34).padEnd(34)} ${dim(r.reason)}`,
+          );
+        }
+        ctx.out();
+        return;
+      }
+
+      // 每次强制重读 —— 改完配置不用重启
+      const loaded = loadPolicy(true);
+      for (const w of loaded.warnings) ctx.out(red(w));
+      ctx.out(
+        bold(
+          `[能力网关 · 规则来自 ${loaded.source}` +
+            `${loaded.envKeys.length ? ` + 环境变量 ${loaded.envKeys.join(',')}` : ''}]`,
+        ),
+      );
+      ctx.out(
+        `  default ${loaded.spec.default} · roots ${loaded.spec.roots.join(', ')}` +
+          ` · ignore ${loaded.spec.ignore.join(', ')}`,
+      );
+      const me = currentAgent(ctx.state);
+      for (const a of Object.values(AGENTS)) {
+        const rules = loaded.spec.agents[a.id] ?? {};
+        const parts = Object.entries(rules)
+          .map(([k, v]) => `${k}=${v === 'allow' ? green(v) : red(v)}`)
+          .join(' ');
+        ctx.out(`  ${a.id === me ? green('▸') : ' '} ${a.id} ${parts || dim('（无规则 → 落 default）')}`);
+      }
+      ctx.out(
+        dim(
+          `  exec 白名单 ${loaded.spec.exec.allowCommands.join(',') || '（空）'}` +
+            ` · net 白名单 ${loaded.spec.net.allowDomains.join(',') || '（空）'}`,
+        ),
+      );
+      ctx.out(
+        dim(
+          `  配置文件 ${policyPath()}（HIVE_POLICY 可换路径）· 可用 ${ENV_KEYS.filter((k) => k !== 'HIVE_POLICY').join('/')} 覆盖`,
+        ),
+      );
+      ctx.out(dim('  /policy log 看最近判罚 · 被拒的动作不进模型，等于没花钱。'));
       ctx.out();
     },
   },
@@ -902,10 +996,16 @@ export const COMMANDS: Command[] = [
       ctx.out(`  API key       ${hasApiKey() ? green('已设置') : red('未设置（.env 里填 DEEPSEEK_API_KEY）')}`);
       ctx.out(`  账本          ${ctx.ledger.open_ ? green('已打开') : red('打不开')} · ${ctx.ledger.path}`);
       ctx.out(`  checkpoint    ${ctx.agent.memoryFile}`);
-      ctx.out(`  工作目录      ${ROOT}`);
+      ctx.out(`  工作目录      ${process.cwd()}`);
       const t = ctx.ledger.totals();
       if (t) ctx.out(`  账本行数      ${t.rows} 行 · 起自 ${(ctx.ledger.since() ?? '—').slice(0, 19)}`);
-      ctx.out(`  工具          ${ALL_TOOLS.map((x) => x.name).join(', ')}（描述合计 ${toolsChars()} 字符）`);
+      const me = currentAgent(ctx.state);
+      const pol = loadPolicy();
+      ctx.out(
+        `  能力网关      ${pol.source} · default ${pol.spec.default} · roots ${pol.spec.roots.join(',')}` +
+          (pol.envKeys.length ? ` · env ${pol.envKeys.join(',')}` : ''),
+      );
+      ctx.out(`  工具（身份 ${me}） ${toolsFor(me).map((x) => x.name).join(', ')}（schema 合计 ${toolsCharsFor(me)} 字符）`);
       ctx.out(`  命令          ${COMMANDS.length} 个`);
       const m = ctx.state.lastTurn;
       if (m?.lastRaw) {
@@ -964,6 +1064,7 @@ export function footerInput(ctx: Ctx) {
     lastTurn: ctx.state.lastTurn,
     session: ctx.session,
     history: ctx.ledger.totals(),
+    denied: ctx.state.lastDenied,
   };
 }
 

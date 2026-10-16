@@ -138,6 +138,11 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
       module: o.deps.module,
       tail: o.deps.tail,
       budgetTokens: budget,
+      // v3 M2：子任务以**被借调的身份**跑 —— 工具集与网关判据都按它算，
+      // 判罚也落在同一个账本上（带上 taskId 便于对账）
+      agent: o.as,
+      ledger: o.deps.ledger,
+      taskId: o.input.taskId,
       ...(childDelegate ? { delegate: childDelegate } : {}),
     };
     const res = await o.deps.runner.run(req, o.onChunk);

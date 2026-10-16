@@ -11,7 +11,7 @@ import type { Band } from '../core/cost.js';
 import type { LedgerTotals } from '../core/ledger.js';
 import type { SessionTally, TokenMeter } from '../core/meter.js';
 import { agentOf, type AgentModule } from '../core/modules.js';
-import { bold, colWidth, cyan, dim, fmtPct, fmtTok, fmtUsd, visibleWidth, yellow } from './format.js';
+import { bold, colWidth, cyan, dim, fmtPct, fmtTok, fmtUsd, red, visibleWidth, yellow } from './format.js';
 
 export interface FooterInput {
   model: string;
@@ -27,6 +27,8 @@ export interface FooterInput {
   lastTurn: TokenMeter | null;
   session: SessionTally;
   history: LedgerTotals | null;
+  /** v3 M2：本轮被能力网关拒了几次 —— 0 时这一段完全不出现 */
+  denied?: number;
 }
 
 const SEP = dim(' │ ');
@@ -78,6 +80,9 @@ function segments(f: FooterInput): string[] {
   if (f.stack.length > 1) {
     out.push(`栈 ${f.stack.map((id) => agentOf(id) ?? '?').join('›')}`);
   }
+
+  // v3 M2：有拒绝时才出现，且排在最右（宽度不够第一个被丢）
+  if (f.denied) out.push(red(`拒 ${f.denied}`));
 
   return out;
 }

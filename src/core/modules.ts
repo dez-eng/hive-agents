@@ -1,15 +1,16 @@
 /**
  * 模块注册表 —— 骨架阶段的核心数据结构。
  *
- * 一个「模块」= 一段角色片 + 工具白名单 + 思考预算。切换模块只换尾部那一段，
+ * 一个「模块」= 一段角色片 + 思考预算。切换模块只换尾部那一段，
  * 绝不碰 system 前缀（那是缓存的命根子，见 prompt.ts）。
  *
  * v2 起每个模块挂在一个 agent（A 主 / B 侦察 / C 修复 / D 审计）名下，
- * 见下面的 AGENTS 表：身份决定「能借调谁」，而执行层按栈顶模块收权。
+ * 见下面的 AGENTS 表：身份决定「能借调谁」。
  *
  * v3（见 docs/V3-PLAN.md）：**能力从模块表搬到身份表**。
- * 模块只管「角色片 + 思考档」；「这个 agent 能干什么」归 `AGENTS[i].capabilities`。
- * 这样同一个 agent 换角色不掉能力，同一角色换 agent 也不带能力走。
+ * 模块只管「角色片 + 思考档」；「这个 agent 能干什么」归 `AGENTS[i].capabilities`，
+ * 由 capability.ts 装配成工具集。于是同一个 agent 换角色不掉能力，
+ * 同一角色换 agent 也不带能力走。
  */
 export type ThinkBudget = 'off' | 'low' | 'high';
 
@@ -18,10 +19,12 @@ export type AgentId = 'A' | 'B' | 'C' | 'D';
 
 /**
  * v3 的 capability 名。每个 capability 是一个独立单元（tools + 它要的权限），
- * 由 agent 声明式装配；沙箱（能力网关）按 agent 身份 + capability 收权。
- * 现阶段的工具白名单是它的前身 —— M2 会把它们真正拆开。
+ * 由 agent 声明式装配（capability.ts）；沙箱（能力网关）按 agent 身份 + capability 收权。
+ *
+ * `shell` / `web` / `skill` M2 只声明、不实现（贡献 0 个工具）。
+ * `calc` 是 v3 补的第 7 个 —— 原来挂在模块表里的算数工具也得有个归属。
  */
-export type CapabilityId = 'fs' | 'shell' | 'search' | 'web' | 'skill' | 'delegate';
+export type CapabilityId = 'fs' | 'search' | 'calc' | 'shell' | 'web' | 'skill' | 'delegate';
 
 export interface AgentModule {
   /** 唯一 id，命令里用 /use <id> 切 */
@@ -35,8 +38,6 @@ export interface AgentModule {
    * 写短：它每轮都在，长了就是每轮都在付钱。
    */
   fragment: string;
-  /** 该模块可用的工具名（执行层白名单），空数组 = 不给工具 */
-  tools: string[];
   /**
    * 思考预算。→ 请求字段的映射见 think.ts 的 THINK_KWARGS（由 /thinktest 实测得出）：
    * off / low 关思考，high 放开。agent.ts 按栈顶模块的 think 档选模型实例。
@@ -50,9 +51,8 @@ export const MODULES: Record<string, AgentModule> = {
   assistant: {
     id: 'assistant',
     title: '通用',
-    summary: '主控 A：读文件、算数、把子任务借调出去',
-    fragment: '当前是主控：能读文件、能算数，需要动手时把子任务交给别的角色。',
-    tools: ['calculator', 'read_file', 'delegate'],
+    summary: '主控 A：读文件、搜内容、算数、把子任务借调出去',
+    fragment: '当前是主控：能读文件、能搜内容、能算数，需要动手时把子任务交给别的角色。',
     think: 'low',
     owner: 'A',
   },
@@ -61,7 +61,6 @@ export const MODULES: Record<string, AgentModule> = {
     title: '算数',
     summary: '只做算式，不给解释 —— 窄能力换低思考',
     fragment: '当前是算数器：只回算式的结果，一个数，不解释、不寒暄。',
-    tools: ['calculator'],
     think: 'off',
     owner: 'A',
   },
@@ -71,7 +70,6 @@ export const MODULES: Record<string, AgentModule> = {
     summary: '信息收集：只陈列事实与来源，需要动手时借调 C/D（v2 给 B agent）',
     fragment:
       '当前是侦察角色：只收集并陈列事实，标出每条事实的来源（哪个文件、哪一行）；不给建议、不下结论。需要动手改文件时，用 delegate 交给修复角色。',
-    tools: ['read_file', 'delegate'],
     think: 'high',
     owner: 'B',
   },
@@ -80,7 +78,6 @@ export const MODULES: Record<string, AgentModule> = {
     title: '修复',
     summary: '按给定目标与差异改文件，不扩大范围（v2 给 C agent）',
     fragment: '当前是修复角色：只按给定的目标与差异改文件，不顺手重构、不扩大范围。',
-    tools: ['read_file', 'write_file'],
     think: 'low',
     owner: 'C',
   },
@@ -90,7 +87,6 @@ export const MODULES: Record<string, AgentModule> = {
     summary: '复核：只找与事实不符之处（v2 给 D agent）',
     fragment:
       '当前是审计角色：只核对给定结论与原始事实是否一致，指出不一致的条目；不补充新方案。',
-    tools: ['read_file'],
     think: 'high',
     owner: 'D',
   },
@@ -100,15 +96,18 @@ export const MODULES: Record<string, AgentModule> = {
  * 身份表 —— v2 的授权地基，v3 的「agent 定义」。
  *
  * `mayCall` 是「谁可以向谁借调」的唯一真相；执行层按它 + 令牌一起挡。
- * `capabilities` 是「这个 agent 能装配哪些能力」；v3 的能力网关按它收权。
- * 两条都写在数据里而不是提示词里 —— 模型看不到，也绕不过。
+ * `capabilities` 是「这个 agent 装哪些能力」，工具集由它装配（capability.ts），
+ * 能力网关也按它收权。两条都写在数据里而不是提示词里 —— 模型看不到，也绕不过。
+ *
+ * ⚠「装了什么」不等于「准干什么」：B/D 装 fs 就有 write_file 的 schema，
+ * 但 policy 默认只给它们 fs.read，真去写会被网关拒并落账。
  */
 export interface AgentSpec {
   id: AgentId;
   title: string;
   /** 该 agent 的主模块 —— `/as <agent>` 压栈的就是它 */
   home: string;
-  /** v3：这个 agent 装哪些 capability（见 CapabilityId） */
+  /** v3：这个 agent 装哪些 capability（见 CapabilityId）—— 工具集由它决定 */
   capabilities: CapabilityId[];
   /** v3：这个 agent 的默认思考档（模块自身的 think 优先） */
   think?: ThinkBudget;
@@ -124,7 +123,7 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     id: 'A',
     title: '主控',
     home: 'assistant',
-    capabilities: ['fs', 'search', 'delegate'],
+    capabilities: ['fs', 'search', 'calc', 'delegate'],
     think: 'low',
     mayCall: ['B', 'C', 'D'],
     standalone: true,
@@ -134,7 +133,9 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     id: 'B',
     title: '侦察',
     home: 'recon',
-    capabilities: ['search', 'delegate'],
+    // fs 是 M2 补上的：侦察必须能读文件（V3-PLAN §1 第 2 条硬伤）；
+    // 写权限由 policy 收（默认 deny），不是靠不给工具
+    capabilities: ['fs', 'search', 'delegate'],
     think: 'high',
     mayCall: ['C', 'D'],
     standalone: true,
@@ -154,7 +155,7 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     id: 'D',
     title: '审计',
     home: 'audit',
-    capabilities: ['search'],
+    capabilities: ['fs', 'search'],
     think: 'high',
     mayCall: [],
     standalone: true,

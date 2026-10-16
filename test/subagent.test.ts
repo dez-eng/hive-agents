@@ -53,6 +53,7 @@ class FakeRunner implements TurnRunner {
       sentContent: req.text,
       meter,
       budgetHit: this.cfg.budgetHit ?? false,
+      denied: 0,
     };
   }
 }

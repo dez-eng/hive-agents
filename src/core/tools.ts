@@ -2,26 +2,27 @@
  * 工具。描述已瘦身 —— 它每轮都在 prompt 里，多一个字就是每轮多一个字。
  * 工具 schema 属于冻结区的一部分，改描述同样会作废缓存。
  *
- * v2：工具**一次加齐**（§7 的一次性前缀税）。加 write_file（C 修复要动手）
- * 与 delegate（借调入口）都在这版进 ALL_TOOLS —— 别边做边加，那是每加一个
- * 就作废一次全盘缓存。
+ * v2：工具**一次加齐**（§7 的一次性前缀税）。
+ * v3 M2：工具归 **capability**（capability.ts），按身份装配 ——
+ * 加一个工具只作废「装了它的那些 agent」的缓存，不是全盘（V3-PLAN §3.1）。
+ * 本文件只负责工具**本身**：契约、上限、越界兜底。
  *
- * ⚠ 注意：工具定义给**所有模块**（指令层全套），能真正调用哪个由执行层
- * 按模块白名单挡（见 agent.ts 的 callTools）。delegate 还多一层：它不在
- * 本文件里真正执行，而是由执行层接管，先过令牌与预算闸门。
+ * ⚠ 两层收权，别搞混：
+ *   · 网关（policy.ts）按身份判「这一次准不准」—— 那才是判定
+ *   · 这里的越界检查是**兜底**：工具可能被直接调用（测试、嵌入），得自己守住
  */
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
-export const ROOT = resolve(process.cwd());
+import { withinRoots } from './policy.js';
 
 /**
  * 一次读取的上限。4,000 字符 ≈ 1,300 token，
  * 而工具结果必然是全价未命中 —— 这个数别放大。
  */
-const READ_LIMIT = 4000;
+export const READ_LIMIT = 4000;
 
 export const calculator = tool(
   async ({ expression }: { expression: string }): Promise<string> => {
@@ -45,10 +46,10 @@ export const calculator = tool(
 
 export const readFileTool = tool(
   async ({ path }: { path: string }): Promise<string> => {
-    const target = resolve(ROOT, path);
-    // 前缀比较要带分隔符，否则 D:\proj 会放行 D:\proj-evil
-    if (target !== ROOT && !target.startsWith(ROOT + sep)) {
-      return 'ERROR: 越界，只能读项目目录内的文件';
+    const target = resolve(process.cwd(), path);
+    // 兜底：真正的判定在网关；这里只保证「无论谁调，都出不了 roots」
+    if (!withinRoots(target)) {
+      return 'ERROR: 越界，只能读 roots（当前策略）内的文件';
     }
     try {
       if (!statSync(target).isFile()) return `ERROR: 不是文件 ${path}`;
@@ -59,16 +60,16 @@ export const readFileTool = tool(
   },
   {
     name: 'read_file',
-    description: '读项目目录内的文件，path 用相对路径。',
+    description: '读 roots 内的文件，path 用相对路径。',
     schema: z.object({ path: z.string().describe('相对路径，例如 src/index.ts') }),
   },
 );
 
 export const writeFileTool = tool(
   async ({ path, content }: { path: string; content: string }): Promise<string> => {
-    const target = resolve(ROOT, path);
-    if (target !== ROOT && !target.startsWith(ROOT + sep)) {
-      return 'ERROR: 越界，只能写项目目录内的文件';
+    const target = resolve(process.cwd(), path);
+    if (!withinRoots(target)) {
+      return 'ERROR: 越界，只能写 roots（当前策略）内的文件';
     }
     try {
       mkdirSync(dirname(target), { recursive: true });
@@ -80,7 +81,7 @@ export const writeFileTool = tool(
   },
   {
     name: 'write_file',
-    description: '把内容写入（覆盖）项目目录内的文件，path 用相对路径。',
+    description: '把内容写入（覆盖）roots 内的文件，path 用相对路径。',
     schema: z.object({
       path: z.string().describe('相对路径'),
       content: z.string().describe('要写入的完整内容'),
@@ -113,26 +114,6 @@ export const delegateTool = tool(
     }),
   },
 );
-
-export const ALL_TOOLS = [calculator, readFileTool, writeFileTool, delegateTool];
-
-export const TOOL_MAP: Record<string, (typeof ALL_TOOLS)[number]> = Object.fromEntries(
-  ALL_TOOLS.map((t) => [t.name, t]),
-);
-
-/** 工具定义在 prompt 里占多少字符 —— 它是冻结区的一部分 */
-export function toolsChars(): number {
-  let n = 0;
-  for (const t of ALL_TOOLS) {
-    n += t.name.length + (t.description ?? '').length;
-    try {
-      n += JSON.stringify(z.toJSONSchema(t.schema)).length;
-    } catch {
-      /* 拿不到 schema 就算了 */
-    }
-  }
-  return n;
-}
 
 /**
  * 极小的表达式求值器：递归下降，只认 + - * / % 和括号。

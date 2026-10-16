@@ -38,11 +38,12 @@ import type { Token } from './grant.js';
 import { makeTaskId, parseHandoffInput } from './handoff.js';
 import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
-import { DEFAULT_MODULE, MODULES, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
+import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
 import { STABLE_PREFIX, renderUserContent } from './prompt.js';
 import { runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
-import { ALL_TOOLS, TOOL_MAP } from './tools.js';
+import { TOOL_MAP, capabilityOfTool, kindOf, toolsFor } from './capability.js';
+import { checkAction, type Action } from './policy.js';
 
 export const StateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -88,6 +89,15 @@ export interface TurnRequest {
   budgetTokens?: number;
   /** v2：借调上下文。不传 = 这一轮里 delegate 不可用 */
   delegate?: DelegateContext;
+  /**
+   * v3 M2：这一轮以**谁**的身份跑 —— 决定工具集（toolsFor）、网关判据（by）
+   * 与账本的 agent 栏。借调子任务传被借调的身份，独立会话传栈顶身份。
+   */
+  agent: AgentId;
+  /** v3 M2：网关判定要落账；没有账本就只回一句话，不留痕 */
+  ledger?: Ledger;
+  /** v3 M2：子任务的 taskId（policy 行跟着它走，便于对账） */
+  taskId?: string;
 }
 
 export interface TurnResult {
@@ -98,6 +108,8 @@ export interface TurnResult {
   meter: TokenMeter;
   /** v2：这一轮是否被预算闸门熔断（模型没再被调用） */
   budgetHit: boolean;
+  /** v3 M2：本轮被能力网关拒了几次（footer 的「拒 N」用） */
+  denied: number;
 }
 
 export interface AgentOptions {
@@ -107,13 +119,24 @@ export interface AgentOptions {
   chat?: BaseChatModel;
 }
 
-/** 一轮的运行时：计量器 + 预算上限 + 借调上下文 + 当前思考档 */
+/** 一轮的运行时：计量器 + 预算上限 + 借调上下文 + 当前思考档 + 身份（v3 M2） */
 interface GraphRuntime {
   meter: TokenMeter | null;
   budgetTokens: number;
   delegate: DelegateContext | null;
   think: ThinkBudget;
+  /** v3 M2：这一轮是谁 —— 选哪套绑定好的模型（工具 schema 按身份不同） */
+  agent: AgentId;
+  /** v3 M2：判罚落账。null = 不落痕（测试里传假 runner 时常见） */
+  ledger: Ledger | null;
+  threadId: string;
+  taskId?: string;
+  /** v3 M2：本轮被拒次数 */
+  denied: number;
 }
+
+/** bindTools 之后的模型不再是 BaseChatModel 而是 Runnable，单独取个名 */
+type BoundModel = ReturnType<NonNullable<BaseChatModel['bindTools']>>;
 
 /** 建一个带思考档位的模型。档位映射见 think.ts（由 /thinktest 实测得出） */
 function buildModel(modelId: string, think: ThinkBudget): ChatDeepSeek {
@@ -177,17 +200,96 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
   return `[${input.to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
 }
 
+/** 工具调用 → 网关要看的动作目标 */
+function actionTarget(name: string, args: Record<string, unknown>): string {
+  const pick = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
+  switch (name) {
+    case 'read_file':
+    case 'write_file':
+      return pick('path');
+    case 'grep':
+      return pick('path') || pick('glob') || '.';
+    case 'glob':
+      return pick('pattern');
+    case 'delegate':
+      return pick('to');
+    default:
+      return '';
+  }
+}
+
+/**
+ * 能力网关的那道门（docs/V3-M2-DESIGN.md §2.5 第 3 步）。
+ * 返回 null = 放行；返回字符串 = 给模型的拒绝文本（**且已落账**）。
+ * 没有 kind 的工具（calculator）无副作用，不进网关。
+ *
+ * 落账是「放行与拒绝都记」—— 放行的量等于工具调用次数，可控；
+ * 而所有 token 统计都按 tag='turn' 过滤，所以 policy 行不污染账单。
+ */
+function gateToolCall(
+  name: string,
+  raw: unknown,
+  agent: AgentId,
+  runtime: GraphRuntime,
+): string | null {
+  const kind = kindOf(name);
+  const capability = capabilityOfTool(name);
+  if (!kind || !capability) return null;
+
+  const action: Action = {
+    kind,
+    target: actionTarget(name, asObj(raw)),
+    by: agent,
+    capability,
+    tool: name,
+    threadId: runtime.threadId,
+    ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+  };
+  const v = checkAction(action);
+
+  runtime.ledger?.insertPolicy({
+    capability,
+    agent,
+    target: action.target,
+    verdict: v.code,
+    reason: v.reason,
+    threadId: runtime.threadId,
+    ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+  });
+
+  if (v.allow) return null;
+  runtime.denied += 1;
+  return `ERROR: 被策略拒绝（${v.reason}）`;
+}
+
 function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: BaseCheckpointSaver) {
   // 当前这一轮的运行时。一次只有一个活跃 run（REPL 串行），
   // 借调嵌套时用「保存-设置-恢复」保证各自读各自的计量。
-  let runtime: GraphRuntime = { meter: null, budgetTokens: 0, delegate: null, think: 'low' };
-
-  // 注入的模型必须支持 bindTools（ChatDeepSeek 与测试用假模型都实现了它）
-  const bound = {
-    off: models.off.bindTools!(ALL_TOOLS),
-    low: models.low.bindTools!(ALL_TOOLS),
-    high: models.high.bindTools!(ALL_TOOLS),
+  let runtime: GraphRuntime = {
+    meter: null,
+    budgetTokens: 0,
+    delegate: null,
+    think: 'low',
+    agent: DEFAULT_AGENT,
+    ledger: null,
+    threadId: '',
+    denied: 0,
   };
+
+  // v3 M2：**每个 agent 一套工具**（V3-PLAN §3.1）—— 缓存单位从「全局一套」
+  // 改成「每个 agent 一套」，各 agent 各自冷启动一次，互不影响。
+  // 工具顺序由 capability.ts 的注册表定死，这里不能排序、不能重排，
+  // 否则前缀字节一变就是一次缓存作废。
+  // think 档走 modelKwargs（请求体，不进 prompt），所以同一 agent 的三档共用一份缓存。
+  const bound = {} as Record<AgentId, Record<ThinkBudget, BoundModel>>;
+  for (const id of Object.keys(AGENTS) as AgentId[]) {
+    const tools = toolsFor(id);
+    bound[id] = {
+      off: models.off.bindTools!(tools),
+      low: models.low.bindTools!(tools),
+      high: models.high.bindTools!(tools),
+    };
+  }
 
   const callModel = async (state: typeof StateAnnotation.State) => {
     // §6：闸门在模型调用之前。超了就不发请求，直接熔断这一轮
@@ -195,14 +297,15 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
       throw new BudgetExceeded(tokenSpent(runtime.meter), runtime.budgetTokens);
     }
     const messages = [new SystemMessage(STABLE_PREFIX), ...state.messages];
-    const reply = await bound[runtime.think].invoke(messages);
+    const reply = await bound[runtime.agent][runtime.think].invoke(messages);
     return { messages: [reply] };
   };
 
   const callTools = async (state: typeof StateAnnotation.State) => {
     const last = state.messages[state.messages.length - 1];
-    const mod = getModule(state.module) ?? MODULES[DEFAULT_MODULE]!;
-    const allowed = new Set(mod.tools);
+    const agent = runtime.agent;
+    // v3 M2：判据是**身份**的 capability 装配，不再是模块的白名单
+    const allowed = new Set(toolsFor(agent).map((t) => t.name));
     const out: ToolMessage[] = [];
 
     for (const call of isAIMessage(last as BaseMessage) ? ((last as AIMessage).tool_calls ?? []) : []) {
@@ -214,15 +317,22 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
       if (!fn) {
         result = `ERROR: 没有这个工具 ${name}`;
       } else if (!allowed.has(name)) {
-        result = `ERROR: 当前模块（${mod.id}）没开 ${name}`;
-      } else if (name === 'delegate') {
-        // 借调走执行层：先令牌 + 预算，再由 runSubagent 跑
-        result = await handleDelegate(call.args, runtime);
+        // 第一道门：这个身份有没有这件工具
+        result = `ERROR: 身份 ${agent} 没装工具 ${name}（/caps 看各身份装了什么）`;
       } else {
-        try {
-          result = String(await fn.invoke(call.args));
-        } catch (e) {
-          result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+        // 第二道门：能力网关 —— 这一次准不准（拒绝会落账，且不进模型）
+        const blocked = gateToolCall(name, call.args, agent, runtime);
+        if (blocked) {
+          result = blocked;
+        } else if (name === 'delegate') {
+          // 借调走执行层：先令牌 + 预算，再由 runSubagent 跑
+          result = await handleDelegate(call.args, runtime);
+        } else {
+          try {
+            result = String(await fn.invoke(call.args));
+          } catch (e) {
+            result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+          }
         }
       }
       out.push(new ToolMessage({ content: result, tool_call_id: call.id ?? '' }));
@@ -305,6 +415,11 @@ export class HiveAgent {
       budgetTokens: req.budgetTokens ?? 0,
       delegate: req.delegate ?? null,
       think: req.module.think,
+      agent: req.agent,
+      ledger: req.ledger ?? null,
+      threadId: req.threadId,
+      ...(req.taskId ? { taskId: req.taskId } : {}),
+      denied: 0,
     });
 
     const config = {
@@ -328,13 +443,22 @@ export class HiveAgent {
         onChunk?.(piece);
       }
     } catch (e) {
-      if (isBudgetExceeded(e)) return { text, sentContent, meter, budgetHit: true };
+      if (isBudgetExceeded(e)) {
+        return {
+          text,
+          sentContent,
+          meter,
+          budgetHit: true,
+          denied: this.graph.getRuntime().denied,
+        };
+      }
       throw e;
     } finally {
       this.graph.setRuntime(saved);
     }
 
-    return { text, sentContent, meter, budgetHit: false };
+    // 注意：return 的表达式在 finally 之前求值 —— 这里读到的还是本轮 runtime
+    return { text, sentContent, meter, budgetHit: false, denied: this.graph.getRuntime().denied };
   }
 
   async history(threadId: string): Promise<BaseMessage[]> {

@@ -71,7 +71,15 @@ async function main(): Promise<number> {
     const mod = getModule(ra.as ? getAgent(ra.as)!.home : DEFAULT_MODULE) ?? getModule(DEFAULT_MODULE)!;
     try {
       const res = await ctx.agent.run(
-        { text, threadId: ctx.state.thread, module: mod, tail: ctx.state.tail },
+        {
+          text,
+          threadId: ctx.state.thread,
+          module: mod,
+          tail: ctx.state.tail,
+          // v3 M2：身份决定工具集与网关判据；账本给网关落判罚
+          agent: ra.as ?? DEFAULT_AGENT,
+          ledger: ctx.ledger,
+        },
         (piece) => process.stdout.write(piece),
       );
       process.stdout.write('\n');

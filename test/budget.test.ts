@@ -108,7 +108,7 @@ test('假模型跑通一轮工具轮：无闸门时不熔断，两次调用都�
     const agent = new HiveAgent({ model: 'deepseek-flash', memoryPath: join(dir, 'm.db'), chat });
     const mod = getModule('assistant')!; // assistant 开了 calculator
 
-    const res = await agent.run({ text: '1+1 等于几', threadId: 't1', module: mod, tail: false });
+    const res = await agent.run({ text: '1+1 等于几', threadId: 't1', module: mod, tail: false, agent: 'A' });
 
     assert.equal(res.budgetHit, false);
     assert.equal(res.text, '结果是 2');
@@ -139,6 +139,7 @@ test('预算闸门：第二次 callModel 前熔断，模型只被调一次', asy
       module: mod,
       tail: false,
       budgetTokens: 500,
+      agent: 'A',
     });
 
     assert.equal(res.budgetHit, true, '被闸门熔断');
@@ -166,6 +167,7 @@ test('预算充足时不影响工具轮正常收尾', async () => {
       module: mod,
       tail: false,
       budgetTokens: 100_000,
+      agent: 'A',
     });
 
     assert.equal(res.budgetHit, false);
