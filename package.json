@@ -37,6 +37,7 @@
     "test": "node --import tsx --test test/*.test.ts",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
