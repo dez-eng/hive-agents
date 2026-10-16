@@ -54,6 +54,7 @@ class FakeRunner implements TurnRunner {
       meter,
       budgetHit: this.cfg.budgetHit ?? false,
       denied: 0,
+      steps: 0,
     };
   }
 }

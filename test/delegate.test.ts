@@ -60,7 +60,14 @@ class FakeRunner implements TurnRunner {
     this.seen.push(req);
     const meter = new TokenMeter({ model: 'deepseek-flash' });
     meter.absorb({ calls: 1, inTok: 100, outTok: 20, cacheHit: 0, reasoning: 0 });
-    return { text: '改动完成：把比较改成 startsWith', sentContent: req.text, meter, budgetHit: false, denied: 0 };
+    return {
+      text: '改动完成：把比较改成 startsWith',
+      sentContent: req.text,
+      meter,
+      budgetHit: false,
+      denied: 0,
+      steps: 0,
+    };
   }
 }
 
@@ -84,7 +91,7 @@ test('v3 M2：工具按**身份**装配（模块表不再管这个）', () => {
   assert.ok(toolNamesFor('C').includes('write_file'));
   assert.ok(!toolNamesFor('C').includes('delegate'), 'C 不借调谁');
   assert.ok(!toolNamesFor('D').includes('delegate'), 'D 不借调谁');
-  assert.ok(!toolNamesFor('A').includes('bash'), 'M2 没有 shell capability 的工具');
+  assert.ok(toolNamesFor('A').includes('bash'), 'M2.5 起 shell 全员装（能不能跑由 policy 定）');
 });
 
 test('delegate 工具直接 invoke 不干活 —— 真正执行在执行层', async () => {

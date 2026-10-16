@@ -26,7 +26,7 @@ test('每个身份引用的工具名都真实存在 —— 拼错就等于权限
 });
 
 test('工具集按能力装配：C 只有文件工具，D 有搜索，A 有算数', () => {
-  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file']);
+  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file', 'edit_file', 'bash']);
   assert.ok(toolNamesFor('D').includes('grep'), 'D 该有搜索能力');
   assert.ok(!toolNamesFor('D').includes('write_file') === false, 'D 装 fs，schema 里有 write_file');
   assert.ok(toolNamesFor('A').includes('calculator'));

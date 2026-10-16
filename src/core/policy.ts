@@ -264,6 +264,12 @@ export function withinRoots(target: string, spec: PolicySpec = currentSpec(), cw
   return false;
 }
 
+/** 命令的第一个词（去掉路径）—— exec 白名单按它比对；bash.ts 也用这个，保证只有一份语义 */
+export function commandBase(command: string): string {
+  const first = command.trim().split(/\s+/)[0] ?? '';
+  return first.split(/[\\/]/).pop() ?? first;
+}
+
 function verdict(allow: boolean, code: VerdictCode, reason: string, rule: string): Verdict {
   return { allow, code, reason, rule };
 }
@@ -331,10 +337,16 @@ export function checkAction(a: Action, spec: PolicySpec = currentSpec()): Verdic
   }
 
   if (a.kind === 'exec') {
-    const bin = a.target.trim().split(/\s+/)[0] ?? '';
-    const base = bin.split(/[\\/]/).pop() ?? bin;
-    if (!spec.exec.allowCommands.includes(base)) {
-      return verdict(false, 'denied', `命令 ${base} 不在 exec.allowCommands 里`, 'exec.allowCommands');
+    const allow = spec.exec.allowCommands;
+    const base = commandBase(a.target);
+    // "*" = 不限（自担风险）；否则按 basename 精确比对 —— 正因为不给 shell，这么判才成立
+    if (!allow.includes('*') && !allow.includes(base)) {
+      return verdict(
+        false,
+        'denied',
+        `命令 ${base} 不在 exec.allowCommands 里（要放开就加 "${base}"，或写 "*" 表示不限）`,
+        'exec.allowCommands',
+      );
     }
   }
 

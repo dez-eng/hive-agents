@@ -12,7 +12,7 @@ import { silenceSqliteWarning } from './core/warn.js';
 
 silenceSqliteWarning();
 
-import { APP_NAME, VERSION, hasApiKey, loadDotEnv, modelName } from './core/config.js';
+import { APP_NAME, VERSION, hasApiKey, loadDotEnv, modelName, toolSteps, turnBudget } from './core/config.js';
 import { DEFAULT_AGENT, DEFAULT_MODULE, getAgent, getModule } from './core/modules.js';
 import { parse, resolveAs } from './core/args.js';
 import { soloThread } from './core/handoff.js';
@@ -79,6 +79,8 @@ async function main(): Promise<number> {
           // v3 M2：身份决定工具集与网关判据；账本给网关落判罚
           agent: ra.as ?? DEFAULT_AGENT,
           ledger: ctx.ledger,
+          // v3 M2.5：单轮也上闸门（与 REPL 一致）
+          budgetTokens: turnBudget(),
         },
         (piece) => process.stdout.write(piece),
       );
@@ -86,6 +88,17 @@ async function main(): Promise<number> {
       ctx.state.lastTurn = res.meter;
       ctx.state.lastDenied = res.denied;
       ctx.session.add(res.meter);
+      // v3 M2.5：两道护栏触发时都说清「为什么停、怎么继续」
+      if (res.budgetHit) {
+        process.stderr.write(`[本轮熔断：超了 ${turnBudget()} token 上限 —— 说「继续」就接着跑]\n`);
+      }
+      const maxSteps = toolSteps();
+      if (maxSteps > 0 && res.steps >= maxSteps) {
+        process.stderr.write(`[本轮工具调用到上限 ${maxSteps} 批，已停下 —— 说「继续」就接着跑]\n`);
+      }
+      if (res.compacted) {
+        process.stderr.write(`[历史已压缩：丢掉 ${res.compacted} 条旧消息 —— 这一次前缀要重算]\n`);
+      }
       ctx.ledger.insert({
         kind: 'turn',
         threadId: ctx.state.thread,

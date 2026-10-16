@@ -14,7 +14,7 @@
  */
 import { createInterface, type Interface } from 'node:readline';
 
-import { APP_NAME, VERSION, currentBand, ledgerPath, memoryPath } from './core/config.js';
+import { APP_NAME, VERSION, currentBand, ledgerPath, memoryPath, toolSteps, turnBudget } from './core/config.js';
 import { HiveAgent, type DelegateContext, type HiveAgent as AgentType } from './core/agent.js';
 import type { Token } from './core/grant.js';
 import { soloThread } from './core/handoff.js';
@@ -140,6 +140,8 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
         // v3 M2：身份决定工具集与网关判据；账本给网关落判罚
         agent: currentAgent(ctx.state),
         ledger: ctx.ledger,
+        // v3 M2.5：自己聊天的这条路也上闸门（原先只有借调子任务有）
+        budgetTokens: turnBudget(),
       },
       (piece) => {
         process.stdout.write(piece);
@@ -152,6 +154,20 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
     ctx.session.add(res.meter);
     if (answer === '') process.stdout.write(dim('（这轮没有可见输出，钱都花在思考上了）'));
     process.stdout.write('\n');
+
+    // v3 M2.5：两道护栏触发时都说清「为什么停、怎么继续」—— 免得看起来像出错
+    if (res.budgetHit) {
+      process.stdout.write(red(`[本轮熔断：超了 ${turnBudget()} token 上限 —— 说「继续」就接着跑]\n`));
+    }
+    const maxSteps = toolSteps();
+    if (maxSteps > 0 && res.steps >= maxSteps) {
+      process.stdout.write(dim(`[本轮工具调用到上限 ${maxSteps} 批，已停下 —— 说「继续」就接着跑]\n`));
+    }
+    if (res.compacted) {
+      process.stdout.write(
+        dim(`[历史已压缩：丢掉 ${res.compacted} 条旧消息 —— 这一次前缀要重算]\n`),
+      );
+    }
 
     ctx.ledger.insert({
       kind: 'turn',

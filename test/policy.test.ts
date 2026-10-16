@@ -105,7 +105,10 @@ test('ask：M2 没有确认通道，按拒绝处理但 code 区分', () => {
 
 test('default 改了也过不了第一关：身份没装的能力照样拒', () => {
   setPolicySpec(normalize({ default: 'allow' }));
-  const v = checkAction(action({ kind: 'exec', capability: 'shell', tool: 'bash', target: 'ls' }));
+  // web 到现在（M2.5）还是「只声明、没实现」，四个身份都没装 —— 拿它当"没这个能力"的样本
+  const v = checkAction(
+    action({ kind: 'net', capability: 'web', tool: 'fetch', target: 'example.com' }),
+  );
   assert.equal(v.code, 'no-capability');
 });
 

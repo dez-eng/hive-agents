@@ -47,14 +47,15 @@ test('工具顺序 = 注册表顺序（顺序即前缀顺序，动它就是作�
 });
 
 test('缓存代价跟着身份走：C 最小，A 最大', () => {
-  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file']);
+  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file', 'edit_file', 'bash']);
   assert.ok(toolsCharsFor('C') < toolsCharsFor('D'), 'D 多了搜索');
   assert.ok(toolsCharsFor('D') < toolsCharsFor('A'), 'A 还多算数与借调');
   assert.ok(toolsCharsFor('C') > 0);
 });
 
 test('声明但未实现的能力：贡献 0 工具（0 token）', () => {
-  assert.deepEqual(declaredOnly(), ['shell', 'web', 'skill']);
+  // M2.5 把 shell 落地了，现在只剩 web / skill 还是空声明
+  assert.deepEqual(declaredOnly(), ['web', 'skill']);
   for (const id of declaredOnly()) {
     assert.equal(CAPABILITIES[id].tools.length, 0);
     assert.ok(!ALL_TOOLS.some((t) => capabilityOfTool(t.name) === id));

@@ -18,7 +18,8 @@ import { z } from 'zod';
 import { AGENTS, type AgentId, type CapabilityId } from './modules.js';
 import type { ActionKind } from './policy.js';
 import { globTool, grepTool } from './search.js';
-import { calculator, delegateTool, readFileTool, writeFileTool } from './tools.js';
+import { bashTool } from './bash.js';
+import { calculator, delegateTool, editFileTool, readFileTool, writeFileTool } from './tools.js';
 
 /** 工具在 capability 层里的统一身份（`tool()` 造出来的都是它） */
 export type AnyTool = StructuredToolInterface;
@@ -51,8 +52,8 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
   fs: {
     id: 'fs',
     title: '文件',
-    summary: '读/写 roots 内的文件（写权限按身份收，见 /policy）',
-    tools: [readFileTool, writeFileTool],
+    summary: '读/写/改 roots 内的文件（写权限按身份收，见 /policy）',
+    tools: [readFileTool, writeFileTool, editFileTool],
     needs: ['fs.read', 'fs.write'],
   },
   search: {
@@ -76,15 +77,15 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
     tools: [delegateTool],
     needs: ['delegate'],
   },
-  // ── 以下三个 M2 只声明、不实现：贡献 0 个工具（0 token），
-  //    `/caps` 会明说「声明了、还没实现」，比凭空冒出一个能力要好。
   shell: {
     id: 'shell',
     title: 'shell',
-    summary: '（声明，未实现）跑命令',
-    tools: [],
+    summary: '跑命令（没 shell 所以不支持管道/重定向；命令要在策略白名单里）',
+    tools: [bashTool],
     needs: ['exec'],
   },
+  // ── 以下两个仍只声明、不实现（M2.5 已经把 shell 落地了）：贡献 0 个工具 = 0 token，
+  //    `/caps` 会明说「声明了、还没实现」，比凭空冒出一个能力要好。
   web: {
     id: 'web',
     title: 'web',
@@ -105,8 +106,10 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
 const TOOL_ACTION: Record<string, ActionKind> = {
   read_file: 'fs.read',
   write_file: 'fs.write',
+  edit_file: 'fs.write',
   grep: 'fs.read',
   glob: 'fs.read',
+  bash: 'exec',
   delegate: 'delegate',
 };
 

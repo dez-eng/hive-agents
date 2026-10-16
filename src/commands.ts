@@ -4,7 +4,7 @@
  * 分工：底部状态行默认只给一行（够用），细节全部藏在命令里。
  * 「某个聊天段花了多少 token」= /turn N 或 /turn N-M 或 /find 词。
  */
-import { BLOCK, VERSION, APP_NAME, currentBand, hasApiKey, memoryPath } from './core/config.js';
+import { BLOCK, VERSION, APP_NAME, currentBand, hasApiKey, memoryPath, toolSteps, turnBudget } from './core/config.js';
 import { priceFor } from './core/cost.js';
 import type { HiveAgent } from './core/agent.js';
 import { Ledger, head, missOf, type LedgerRow } from './core/ledger.js';
@@ -129,6 +129,12 @@ export const COMMANDS: Command[] = [
       const m = st.lastTurn;
       const price = priceFor(ctx.agent.modelId);
       ctx.out(bold('[本次运行 · 只算真实对话]'));
+      ctx.out(
+        dim(
+          `  闸门 本轮 ≤ ${turnBudget() || '不限'} token · 一次 run 工具 ≤ ${toolSteps() || '不限'} 批` +
+            '（HIVE_TURN_BUDGET / HIVE_TOOL_STEPS）',
+        ),
+      );
       ctx.out(
         `  调用 ${ctx.session.total.calls} 次 · 入 ${fmtInt(ctx.session.total.inTok)}` +
           `（缓存 ${fmtInt(ctx.session.total.cacheHit)}` +

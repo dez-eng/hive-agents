@@ -24,6 +24,12 @@ import { withinRoots } from './policy.js';
  */
 export const READ_LIMIT = 4000;
 
+/**
+ * `edit_file` 能处理的文件上限。再大就该是"显式选择整文件重写"，
+ * 而不是让精确替换悄悄地做重活。
+ */
+export const EDIT_MAX_BYTES = 256 * 1024;
+
 export const calculator = tool(
   async ({ expression }: { expression: string }): Promise<string> => {
     const allowed = /^[0-9+\-*/%().\s]*$/;
@@ -85,6 +91,93 @@ export const writeFileTool = tool(
     schema: z.object({
       path: z.string().describe('相对路径'),
       content: z.string().describe('要写入的完整内容'),
+    }),
+  },
+);
+
+/**
+ * 精确替换（v3 M2.5）。**唯一匹配才动手** —— 这是它存在的全部理由：
+ * 改一行不必把整个文件重吐一遍（输出 token 全价，还容易顺手改错别处）。
+ *
+ * 出现 0 次或多次都拒绝并说清「出现在哪些行」，让模型自己补上下文重试 ——
+ * 宁可让它多试一次，也不猜它想改哪一处。
+ */
+export const editFileTool = tool(
+  async ({
+    path,
+    old_string,
+    new_string,
+    replace_all,
+  }: {
+    path: string;
+    old_string: string;
+    new_string: string;
+    replace_all?: boolean;
+  }): Promise<string> => {
+    const target = resolve(process.cwd(), path);
+    if (!withinRoots(target)) {
+      return 'ERROR: 越界，只能改 roots（当前策略）内的文件';
+    }
+
+    let text: string;
+    try {
+      const st = statSync(target);
+      if (!st.isFile()) return `ERROR: 不是文件 ${path}`;
+      if (st.size > EDIT_MAX_BYTES) {
+        return `ERROR: 文件 ${st.size} 字节 > ${EDIT_MAX_BYTES}（256KB）—— 这种情况用 write_file 整文件重写`;
+      }
+      text = readFileSync(target, 'utf8');
+    } catch {
+      return `ERROR: 读不到 ${path}`;
+    }
+
+    if (!old_string) return 'ERROR: old_string 不能为空';
+    if (old_string === new_string) return 'ERROR: old_string 与 new_string 一样，没什么可改';
+
+    const hits: number[] = [];
+    for (let at = text.indexOf(old_string); at !== -1; at = text.indexOf(old_string, at + old_string.length)) {
+      hits.push(at);
+    }
+
+    const lineOf = (pos: number): number => text.slice(0, pos).split('\n').length;
+
+    if (!hits.length) {
+      const lines = text.split('\n').length;
+      return `ERROR: 没找到这段（文件 ${lines} 行）—— 先用 read_file 看清原文，注意缩进与空格要一字不差`;
+    }
+    if (hits.length > 1 && !replace_all) {
+      const shown = hits.slice(0, 8).map(lineOf).join('、');
+      return (
+        `ERROR: 这段出现 ${hits.length} 次（行 ${shown}${hits.length > 8 ? '…' : ''}）—— ` +
+        '要么给更长的上下文让它唯一，要么加 replace_all: true'
+      );
+    }
+
+    const first = hits[0]!;
+    const next = replace_all
+      ? text.split(old_string).join(new_string)
+      : text.slice(0, first) + new_string + text.slice(first + old_string.length);
+
+    try {
+      writeFileSync(target, next, 'utf8');
+    } catch (e) {
+      return `ERROR: 写不了 ${path}（${e instanceof Error ? e.message : String(e)}）`;
+    }
+
+    const n = replace_all ? hits.length : 1;
+    return (
+      `OK: 已替换 ${path}:${lineOf(first)}（${old_string.length} → ${new_string.length} 字符` +
+      `${n > 1 ? `，共 ${n} 处` : ''}）`
+    );
+  },
+  {
+    name: 'edit_file',
+    description: '把文件里唯一的一段 old_string 换成 new_string（比整文件重写省）。',
+    schema: z.object({
+      path: z.string().describe('相对路径'),
+      old_string: z.string().describe('原文片段，要一字不差且唯一'),
+      new_string: z.string().describe('换成什么'),
+      replace_all: z.boolean().optional().describe('多处都换（默认只许唯一匹配）'),
     }),
   },
 );

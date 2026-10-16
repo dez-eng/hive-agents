@@ -33,13 +33,13 @@ import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 import { ChatDeepSeek } from '@langchain/deepseek';
 
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
-import { maxOut, memoryPath, modelName } from './config.js';
+import { compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
 import type { Token } from './grant.js';
 import { makeTaskId, parseHandoffInput } from './handoff.js';
 import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
 import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
-import { STABLE_PREFIX, renderUserContent } from './prompt.js';
+import { STABLE_PREFIX, TAIL_MARK, renderUserContent } from './prompt.js';
 import { runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
 import { TOOL_MAP, capabilityOfTool, kindOf, toolsFor } from './capability.js';
@@ -110,6 +110,10 @@ export interface TurnResult {
   budgetHit: boolean;
   /** v3 M2：本轮被能力网关拒了几次（footer 的「拒 N」用） */
   denied: number;
+  /** v3 M2.5：本轮执行了几批工具调用（到上限就停下，见 afterTools） */
+  steps: number;
+  /** v3 M2.5：本轮发送前压掉了多少条旧消息（0 = 没压） */
+  compacted: number;
 }
 
 export interface AgentOptions {
@@ -133,6 +137,15 @@ interface GraphRuntime {
   taskId?: string;
   /** v3 M2：本轮被拒次数 */
   denied: number;
+  /** v3 M2.5：本轮已执行几批工具（护栏） */
+  steps: number;
+  /** v3 M2.5：本轮压缩丢掉了几条旧消息（累计） */
+  compacted: number;
+  /**
+   * v3 M2.5：**上一轮**的入 token —— 压缩的尺子。
+   * 不能用 `meter.inTok`：那是本轮的计量器，每轮第一次 callModel 时它还是 0。
+   */
+  prevInTok: number;
 }
 
 /** bindTools 之后的模型不再是 BaseChatModel 而是 Runnable，单独取个名 */
@@ -200,6 +213,104 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
   return `[${input.to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
 }
 
+/** 压缩后那条摘要消息的开头 —— 也用来识别「这条已经是摘要了」，别把摘要再摘要一遍 */
+export const SUMMARY_HEAD = '[已压缩的对话要点]';
+
+const SUMMARY_LINE_CHARS = 60;
+const SUMMARY_MAX_LINES = 20;
+
+function clip(s: string, n: number): string {
+  const one = s.replace(/\s+/g, ' ').trim();
+  return one.length > n ? `${one.slice(0, n)}…` : one;
+}
+
+function messageText(m: BaseMessage): string {
+  const c = m.content as unknown;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c
+      .map((p) =>
+        typeof p === 'string' ? p : ((p as { text?: unknown }).text as string | undefined) ?? '',
+      )
+      .join('');
+  }
+  return '';
+}
+
+/** 用户消息末尾挂着角色片（【模块:x】…）—— 摘要里把它剥掉，只留本人说的话 */
+function stripTailMark(text: string): string {
+  const at = text.indexOf(TAIL_MARK);
+  return at === -1 ? text : text.slice(0, at);
+}
+
+/**
+ * 把被丢掉的那些消息压成一条人话（**零 API** —— 不调模型，纯启发式）。
+ * 只取每轮的问句与答句首 60 字：粗，但免费，而且**确定性**（同样的输入永远同样的输出）。
+ */
+export function renderSummary(dropped: BaseMessage[]): string {
+  const lines: string[] = [];
+  let pendingQ = '';
+
+  for (const m of dropped) {
+    const type = m.getType();
+    if (type === 'human') {
+      const text = stripTailMark(messageText(m)).trim();
+      if (!text || text.startsWith(SUMMARY_HEAD)) continue;
+      pendingQ = clip(text, SUMMARY_LINE_CHARS);
+      continue;
+    }
+    if (type === 'ai' && pendingQ) {
+      const ans = clip(messageText(m), SUMMARY_LINE_CHARS);
+      lines.push(ans ? `· 问「${pendingQ}」→ 答「${ans}」` : `· 问「${pendingQ}」`);
+      pendingQ = '';
+    }
+  }
+  if (pendingQ) lines.push(`· 问「${pendingQ}」（未答完）`);
+
+  const shown = lines.slice(0, SUMMARY_MAX_LINES);
+  const rest = lines.length - shown.length;
+  return [
+    `${SUMMARY_HEAD}（压掉 ${dropped.length} 条消息）`,
+    ...shown,
+    ...(rest > 0 ? [`…（其余 ${rest} 轮省略）`] : []),
+  ].join('\n');
+}
+
+export interface CompactionResult {
+  messages: BaseMessage[];
+  dropped: number;
+  /** 有压缩时给出来（也便于测试断言"摘要稳定"） */
+  summary: string | null;
+}
+
+/**
+ * 发送前的压缩（v3 M2.5 §3）。三条自律：
+ *   · **只在超阈值时压**：尺子是上一轮的真实 inTok（免费且准确，不做额外估算）
+ *   · **切点对齐到 human 边界**：每轮以用户消息开头，从那里切才不会把 `tool_calls`
+ *     和它的回包拆散（拆散了模型侧直接报错）
+ *   · **不动 state / checkpoint**：只有发出去的那一份被裁，`/turn`、续会话看到的仍是全量
+ *
+ * ⚠ 代价要说清：压缩改的是 prompt **中段**，缓存按前缀算 —— 压一次就是一次全量重算。
+ * 所以它必须「攒够了做一次」，不能每轮微调；摘要文本也因此必须稳定。
+ */
+export function compactMessages(
+  messages: BaseMessage[],
+  opts: { at: number; keep: number; lastInTok: number },
+): CompactionResult {
+  const untouched: CompactionResult = { messages, dropped: 0, summary: null };
+  if (opts.at <= 0 || opts.keep <= 0) return untouched;
+  if (opts.lastInTok < opts.at) return untouched;
+  if (messages.length <= opts.keep) return untouched;
+
+  let cut = Math.max(messages.length - opts.keep, 0);
+  while (cut < messages.length && messages[cut]!.getType() !== 'human') cut += 1;
+  if (cut <= 0 || cut >= messages.length) return untouched;
+
+  const dropped = messages.slice(0, cut);
+  const summary = renderSummary(dropped);
+  return { messages: [new HumanMessage(summary), ...messages.slice(cut)], dropped: dropped.length, summary };
+}
+
 /** 工具调用 → 网关要看的动作目标 */
 function actionTarget(name: string, args: Record<string, unknown>): string {
   const pick = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '');
@@ -209,8 +320,12 @@ function actionTarget(name: string, args: Record<string, unknown>): string {
       return pick('path');
     case 'grep':
       return pick('path') || pick('glob') || '.';
+    case 'edit_file':
+      return pick('path');
     case 'glob':
       return pick('pattern');
+    case 'bash':
+      return pick('command');
     case 'delegate':
       return pick('to');
     default:
@@ -274,6 +389,9 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     ledger: null,
     threadId: '',
     denied: 0,
+    steps: 0,
+    compacted: 0,
+    prevInTok: 0,
   };
 
   // v3 M2：**每个 agent 一套工具**（V3-PLAN §3.1）—— 缓存单位从「全局一套」
@@ -296,7 +414,16 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     if (runtime.meter && exceedsBudget(runtime.meter, runtime.budgetTokens)) {
       throw new BudgetExceeded(tokenSpent(runtime.meter), runtime.budgetTokens);
     }
-    const messages = [new SystemMessage(STABLE_PREFIX), ...state.messages];
+    // v3 M2.5：发送前压缩。尺子是**上一轮的真实 inTok**（免费且准确，不做估算）。
+    // 只裁要发出去的那一份 —— state / checkpoint 一个字节不改（与 SYSTEM 的处理方式一致）。
+    const packed = compactMessages(state.messages, {
+      at: compressAt(),
+      keep: compressKeep(),
+      lastInTok: runtime.prevInTok,
+    });
+    if (packed.dropped > 0) runtime.compacted += packed.dropped;
+
+    const messages = [new SystemMessage(STABLE_PREFIX), ...packed.messages];
     const reply = await bound[runtime.agent][runtime.think].invoke(messages);
     return { messages: [reply] };
   };
@@ -307,8 +434,14 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     // v3 M2：判据是**身份**的 capability 装配，不再是模块的白名单
     const allowed = new Set(toolsFor(agent).map((t) => t.name));
     const out: ToolMessage[] = [];
+    const calls = isAIMessage(last as BaseMessage) ? ((last as AIMessage).tool_calls ?? []) : [];
 
-    for (const call of isAIMessage(last as BaseMessage) ? ((last as AIMessage).tool_calls ?? []) : []) {
+    // v3 M2.5：这里只计数 —— 拦在「tools 之后回不回 agent」那条条件边（见 afterTools）。
+    // 回一句「到上限了」是不够的：模型完全可以无视它再要一次，那就成了无限循环。
+    // 计数与「限不限」无关：0 = 不限时也数，只是不拦。
+    runtime.steps += 1;
+
+    for (const call of calls) {
       const name = call.name;
       const fn = TOOL_MAP[name] as
         | { invoke: (input: unknown) => Promise<unknown> }
@@ -348,12 +481,22 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     return END;
   };
 
+  /**
+   * v3 M2.5：工具批次到顶就**结束本轮**，不再让模型自由发挥。
+   * 这一步同时满足两个约束：既不会无限循环，又保证历史最后一条是 ToolMessage
+   * 而不是带 tool_calls 的 AIMessage（否则下一次请求会被模型侧拒）。
+   */
+  const afterTools = (): 'agent' | typeof END => {
+    const max = toolSteps();
+    return max > 0 && runtime.steps >= max ? END : 'agent';
+  };
+
   const app = new StateGraph(StateAnnotation)
     .addNode('agent', callModel)
     .addNode('tools', callTools)
     .addEdge(START, 'agent')
     .addConditionalEdges('agent', route, { tools: 'tools', [END]: END })
-    .addEdge('tools', 'agent')
+    .addConditionalEdges('tools', afterTools, { agent: 'agent', [END]: END })
     .compile({ checkpointer });
 
   return {
@@ -368,6 +511,12 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
 export class HiveAgent {
   readonly modelId: string;
   readonly memoryFile: string;
+
+  /**
+   * v3 M2.5：按 thread 记住**上一轮的入 token** —— 压缩的尺子。
+   * 不能拿本轮 meter 当尺子（它是本轮的，第一次调用时是 0）。
+   */
+  private readonly prevInTok = new Map<string, number>();
 
   private readonly graph: ReturnType<typeof buildGraph>;
 
@@ -422,13 +571,21 @@ export class HiveAgent {
       threadId: req.threadId,
       ...(req.taskId ? { taskId: req.taskId } : {}),
       denied: 0,
+      steps: 0,
+      compacted: 0,
+      prevInTok: this.prevInTok.get(req.threadId) ?? 0,
     };
     this.graph.setRuntime(rt);
 
+    // ⚠ LangGraph 自己的递归上限默认 25，比我们的步数护栏更早触发 ——
+    // 一批工具 = 「agent + tools」两次跳转，所以必须把上限抬到 2×步数 + 余量，
+    // 否则先抛的是 GraphRecursionError（那是报错，不是我们想要的「安静停下」）。
+    const steps = toolSteps();
     const config = {
       configurable: { thread_id: req.threadId },
       callbacks: [meter],
       streamMode: 'messages' as const,
+      recursionLimit: steps > 0 ? steps * 2 + 6 : 1000,
     };
 
     let text = '';
@@ -447,14 +604,32 @@ export class HiveAgent {
       }
     } catch (e) {
       if (isBudgetExceeded(e)) {
-        return { text, sentContent, meter, budgetHit: true, denied: rt.denied };
+        return {
+          text,
+          sentContent,
+          meter,
+          budgetHit: true,
+          denied: rt.denied,
+          steps: rt.steps,
+          compacted: rt.compacted,
+        };
       }
       throw e;
     } finally {
+      // 这一轮的入 token 就是下一轮的尺子（在恢复旧 runtime 之前先记下）
+      this.prevInTok.set(req.threadId, meter.inTok);
       this.graph.setRuntime(saved);
     }
 
-    return { text, sentContent, meter, budgetHit: false, denied: rt.denied };
+    return {
+      text,
+      sentContent,
+      meter,
+      budgetHit: false,
+      denied: rt.denied,
+      steps: rt.steps,
+      compacted: rt.compacted,
+    };
   }
 
   async history(threadId: string): Promise<BaseMessage[]> {

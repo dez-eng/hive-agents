@@ -21,7 +21,7 @@ class FakeRunner {
     this.seen.push(req);
     const meter = new TokenMeter({ model: 'deepseek-flash' });
     meter.absorb({ calls: 1, inTok: 100, outTok: 20, cacheHit: 0, reasoning: 0 });
-    return { text: '子任务结论：已修', sentContent: req.text, meter, budgetHit: false, denied: 0 };
+    return { text: '子任务结论：已修', sentContent: req.text, meter, budgetHit: false, denied: 0, steps: 0 };
   }
 }
 
