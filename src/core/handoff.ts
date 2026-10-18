@@ -37,6 +37,11 @@ export const HandoffResultSchema = z.object({
   notes: z.string().optional(),
   /** 是否被预算闸门熔断 */
   budgetHit: z.boolean(),
+  /**
+   * v3 M3：子会话 thread —— 父拿到它就能续跑（不必再查 handoffs）。
+   * 可选是为了兼容 M3 之前的调用方。
+   */
+  thread: z.string().optional(),
 });
 
 export type HandoffInput = z.infer<typeof HandoffInputSchema>;

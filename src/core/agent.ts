@@ -35,12 +35,12 @@ import { ChatDeepSeek } from '@langchain/deepseek';
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
 import { compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
 import type { Token } from './grant.js';
-import { makeTaskId, parseHandoffInput } from './handoff.js';
+import { makeTaskId, parseHandoffInput, type HandoffResult } from './handoff.js';
 import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
 import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
 import { STABLE_PREFIX, TAIL_MARK, renderUserContent } from './prompt.js';
-import { runSubagent, type TurnRunner } from './subagent.js';
+import { continueSubagent, runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
 import { TOOL_MAP, capabilityOfTool, kindOf, toolsFor } from './capability.js';
 import { checkAction, type Action } from './policy.js';
@@ -168,15 +168,70 @@ function asObj(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
 }
 
+/** 借调结果的统一话术（首跑与续跑共用） */
+function formatDelegateResult(res: HandoffResult, to: AgentId, budget: number): string {
+  if (!res.ok) return `ERROR: 借调 ${to} 未通过 —— ${res.notes ?? '（无说明）'}`;
+  if (res.budgetHit) {
+    // 明确告诉上层「是预算不够、不是任务失败」，让它加大预算重试（真机实测过这个坑）
+    return `[${to}·熔断 ${res.tokens}/${budget} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
+  }
+  return `[${to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+}
+
 /**
  * delegate 的执行层接管。到这里说明白名单已放行（当前身份能借调），
- * 剩下的交给 runSubagent —— 它再过令牌与预算。
+ * 剩下的交给 runSubagent / continueSubagent —— 它们再过令牌与预算。
+ *
+ * v3 M3：args.resume 存在 = 续跑。thread 从 handoffs 记录里取，不重新派生；
+ * 归属检查在这里先做一遍（执行核里还有一遍，双保险，且这里能给出更具体的话）。
  */
 async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<string> {
   const ctx = runtime.delegate;
   if (!ctx) return 'ERROR: 当前没有借调上下文（delegate 只能在会话里用）';
 
   const a = asObj(args);
+
+  // ── v3 M3：续跑 ───────────────────────────────────────────
+  const resume = typeof a['resume'] === 'string' ? a['resume'].trim() : '';
+  if (resume) {
+    const rec = ctx.ledger.findHandoff(resume);
+    if (!rec) return `ERROR: 找不到交接 ${resume} —— taskId 见 /handoffs`;
+    if (rec.from !== ctx.from) {
+      return `ERROR: ${ctx.from} 不能续 ${rec.from} 发起的子会话 ${resume}`;
+    }
+    if (!rec.thread) return `ERROR: 交接 ${resume} 没有 thread（M3 之前的记录），无法续跑`;
+    const asked = typeof a['to'] === 'string' ? a['to'].trim().toUpperCase() : '';
+    if (asked && asked !== rec.to) return `ERROR: 续跑目标必须还是 ${rec.to}（不能换人）`;
+
+    const text = typeof a['goal'] === 'string' ? a['goal'].trim() : '';
+    if (!text) return 'ERROR: 续跑要一句话追问（放在 goal 里）';
+    const budget = Number(a['budgetTokens']);
+    if (!Number.isFinite(budget) || budget < 0 || !Number.isInteger(budget)) {
+      return 'ERROR: 续跑也要给 budgetTokens（非负整数）';
+    }
+
+    const to = rec.to as AgentId;
+    const res = await continueSubagent({
+      as: to,
+      from: ctx.from,
+      owner: rec.from as AgentId,
+      token: ctx.token,
+      thread: rec.thread,
+      taskId: resume,
+      text,
+      budgetTokens: budget,
+      deps: {
+        runner: ctx.runner,
+        ledger: ctx.ledger,
+        module: ctx.moduleOf(to),
+        tail: ctx.tail,
+        makeChildDelegate: (childToken, childThread) => ctx.makeChild(childToken, childThread, to),
+      },
+    });
+    return formatDelegateResult(res, to, budget);
+  }
+
+  // ── 首跑 ─────────────────────────────────────────────────
   const parsed = parseHandoffInput({
     taskId: makeTaskId(ctx.seq()),
     from: ctx.from,
@@ -205,12 +260,7 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
     },
   });
 
-  if (!res.ok) return `ERROR: 借调 ${input.to} 未通过 —— ${res.notes ?? '（无说明）'}`;
-  if (res.budgetHit) {
-    // 明确告诉上层「是预算不够、不是任务失败」，让它加大预算重试（真机实测过这个坑）
-    return `[${input.to}·熔断 ${res.tokens}/${input.budgetTokens} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
-  }
-  return `[${input.to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+  return formatDelegateResult(res, input.to, input.budgetTokens);
 }
 
 /** 压缩后那条摘要消息的开头 —— 也用来识别「这条已经是摘要了」，别把摘要再摘要一遍 */

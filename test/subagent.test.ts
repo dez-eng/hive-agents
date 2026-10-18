@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runSubagent, renderSlice, type TurnRunner } from '../src/core/subagent.js';
+import { continueSubagent, runSubagent, renderSlice, type TurnRunner } from '../src/core/subagent.js';
 import type { TurnRequest, TurnResult } from '../src/core/agent.js';
 import { TokenMeter } from '../src/core/meter.js';
 import { Ledger } from '../src/core/ledger.js';
@@ -211,6 +211,8 @@ test('正常借调 B→C：独立 thread、记账带 agent/task、留痕、扣�
     assert.equal(ho.to, 'C');
     assert.equal(ho.tokens, 120);
     assert.equal(ho.ok, true);
+    assert.equal(ho.thread, 'main#C#t001-aaaa', 'v3 M3：thread 落库，续跑靠它');
+    assert.equal(res.thread, 'main#C#t001-aaaa', '首跑就把 thread 返回给上层');
 
     // 令牌扣减
     assert.equal(led.loadToken(tk.id)!.spent, 120);
@@ -300,5 +302,122 @@ test('嵌套（A→B→C 的前半）：A 借调 B 时自动签发，并把一�
     assert.deepEqual(childSeen!.token.mayCall, ['C', 'D'], 'B 可借调 C/D');
     assert.equal(childSeen!.thread, 'main#B#t001-aaaa', '子上下文挂在 B 的独立 thread 上');
     assert.equal(led.liveTokens('B').length, 1, '自动签发的令牌已落库');
+  });
+});
+
+// ── v3 M3：可续子会话 ─────────────────────────────────────
+
+test('续跑：复用同一子 thread、发送追加原文、同 task 两行 handoffs、继续扣令牌', async () => {
+  await withLedger(async (led) => {
+    const runner = new FakeRunner({ text: '第二轮改好了', inTok: 100, outTok: 20 });
+    const tk = token('B', 1000);
+    led.saveToken(tk);
+    const deps = { runner, ledger: led, module: getModule('fix')!, tail: true, now: () => NOW };
+
+    const first = await runSubagent({
+      as: 'C',
+      from: 'B',
+      input: input(),
+      token: tk,
+      thread: 'main',
+      deps,
+    });
+    assert.equal(first.ok, true);
+    assert.equal(first.thread, 'main#C#t001-aaaa');
+
+    const res = await continueSubagent({
+      as: 'C',
+      from: 'B',
+      owner: 'B',
+      token: tk,
+      thread: first.thread!,
+      taskId: 't001-aaaa',
+      text: '再看一下第二个调用点',
+      budgetTokens: 300,
+      deps,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.thread, 'main#C#t001-aaaa');
+    assert.equal(runner.seen.length, 2);
+    assert.equal(runner.seen[1]!.threadId, runner.seen[0]!.threadId, '同一子会话');
+    assert.equal(
+      runner.seen[1]!.text,
+      '再看一下第二个调用点',
+      '续跑发的是追问原文，不是重新渲染的 slice',
+    );
+    assert.equal(runner.seen[1]!.agent, 'C', '身份不变');
+
+    const hos = led.recentHandoffs(2);
+    assert.equal(hos.length, 2);
+    assert.equal(hos[0]!.goal, '[续跑] 再看一下第二个调用点');
+    assert.equal(hos[0]!.thread, 'main#C#t001-aaaa');
+    assert.equal(hos[0]!.expect, '续跑');
+    assert.equal(led.handoffTotals('t001-aaaa')!.rows, 2, '同一 task 的两轮都留痕');
+    assert.equal(led.loadToken(tk.id)!.spent, 240, '首跑 120 + 续跑 120');
+  });
+});
+
+test('续跑：不是原发起方 → 拒，runner 不跑、不留痕', async () => {
+  await withLedger(async (led) => {
+    const runner = new FakeRunner();
+    const res = await continueSubagent({
+      as: 'C',
+      from: 'A',
+      owner: 'B',
+      token: null,
+      thread: 'main#C#t001-aaaa',
+      taskId: 't001-aaaa',
+      text: '我也来问一句',
+      budgetTokens: 200,
+      deps: { runner, ledger: led, module: getModule('fix')!, tail: true, now: () => NOW },
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.notes ?? '', /不能续/);
+    assert.equal(runner.seen.length, 0, '挡在花钱之前');
+    assert.equal(led.recentHandoffs(5).length, 0);
+  });
+});
+
+test('续跑：M3 之前的老记录没有 thread → 明确拒，不猜', async () => {
+  await withLedger(async (led) => {
+    const runner = new FakeRunner();
+    const res = await continueSubagent({
+      as: 'C',
+      from: 'B',
+      owner: 'B',
+      token: token('B'),
+      thread: '',
+      taskId: 'old-1',
+      text: '接着上次的',
+      budgetTokens: 200,
+      deps: { runner, ledger: led, module: getModule('fix')!, tail: true, now: () => NOW },
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.notes ?? '', /没有 thread/);
+    assert.equal(runner.seen.length, 0);
+  });
+});
+
+test('续跑：授权仍走同一道闸 —— 没令牌就拒', async () => {
+  await withLedger(async (led) => {
+    const runner = new FakeRunner();
+    const res = await continueSubagent({
+      as: 'C',
+      from: 'B',
+      owner: 'B',
+      token: null,
+      thread: 'main#C#t001-aaaa',
+      taskId: 't001-aaaa',
+      text: '追一句',
+      budgetTokens: 200,
+      deps: { runner, ledger: led, module: getModule('fix')!, tail: true, now: () => NOW },
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.notes ?? '', /需要令牌/);
+    assert.equal(runner.seen.length, 0);
   });
 });

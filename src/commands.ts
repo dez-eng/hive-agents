@@ -15,6 +15,7 @@ import {
   getAgent,
   getModule,
   moduleList,
+  type AgentId,
 } from './core/modules.js';
 import { STABLE_PREFIX, TAIL_MARK } from './core/prompt.js';
 import { currentAgent, currentModuleId, type ReplState } from './core/session.js';
@@ -22,7 +23,7 @@ import { stackDepth, stackPop, stackPush } from './core/stack.js';
 import { THINK_CANDIDATES, pickThinkingOff, runThinkProbe, thinkVerdict } from './core/think.js';
 import { issueToken, remaining } from './core/grant.js';
 import { makeTaskId, type HandoffInput } from './core/handoff.js';
-import { runSubagent } from './core/subagent.js';
+import { continueSubagent, runSubagent } from './core/subagent.js';
 import {
   declaredOnly,
   toolNamesFor,
@@ -665,9 +666,33 @@ export const COMMANDS: Command[] = [
 
   {
     name: '/ledger',
-    usage: '/ledger [n]',
-    summary: '账本原始行 + 按天汇总',
+    usage: '/ledger [n|agents]',
+    summary: '账本原始行 + 按天汇总；/ledger agents 按身份看命中率与成本',
     async run(ctx, args) {
+      // v3 M3：按身份汇总 —— 每个 agent 独立跑时的命中率与成本
+      if ((args[0] ?? '').trim().toLowerCase() === 'agents') {
+        const rows = ctx.ledger.byAgent();
+        if (!rows.length) {
+          ctx.out(dim('[还没有落账的轮次]\n'));
+          return;
+        }
+        ctx.out(bold('[按身份汇总 · 只算真实对话（policy 行不计）]'));
+        for (const r of rows) {
+          const name = r.agent || '未标记';
+          const avg = r.rows ? r.costUsd / r.rows : 0;
+          ctx.out(
+            `  ${name.padEnd(4)}  ${String(r.rows).padStart(3)} 轮 · ${String(r.calls).padStart(3)} 次调用` +
+              ` · 入 ${fmtInt(r.inTok).padStart(9)}（命中 ${fmtPct(hitRate(r.inTok, r.cacheHit)).padStart(5)}）` +
+              ` · 出 ${fmtInt(r.outTok).padStart(8)}(思考 ${fmtInt(r.reasoning).padStart(7)})` +
+              ` · ${fmtUsd(r.costUsd)} · 均 ${fmtUsd(avg)}/轮`,
+          );
+        }
+        ctx.out();
+        ctx.out(dim('  说明：agent 为空 = M3 之前未标身份的历史行；借调子任务的轮次记在被借调者名下。'));
+        ctx.out();
+        return;
+      }
+
       const limit = Number(args[0]) || 12;
       const rows = ctx.ledger.recent(limit);
       if (!rows.length) {
@@ -875,10 +900,71 @@ export const COMMANDS: Command[] = [
 
   {
     name: '/delegate',
-    usage: '/delegate <A|B|C|D> <目标>',
-    summary: '把任务交给另一个身份（走令牌 + 预算闸门 + 独立 thread）',
+    usage: '/delegate <A|B|C|D> <目标> ｜ /delegate --continue <taskId> <追加内容>',
+    summary: '把任务交给另一个身份（走令牌 + 预算闸门 + 独立 thread）；--continue 续同一个子会话',
     async run(ctx, args) {
-      const to = (args[0] ?? '').trim().toUpperCase();
+      const from = currentAgent(ctx.state);
+      const first = (args[0] ?? '').trim();
+
+      // v3 M3：续跑 —— thread 与目标身份都从 handoffs 记录里取，不重新派生
+      if (first === '--continue' || first === '-c') {
+        const taskId = (args[1] ?? '').trim();
+        const text = args.slice(2).join(' ').trim();
+        if (!taskId || !text) {
+          ctx.out('[用法：/delegate --continue <taskId> <追加内容>]（taskId 见 /handoffs）\n');
+          return;
+        }
+        const rec = ctx.ledger.findHandoff(taskId);
+        if (!rec) {
+          ctx.out(red(`[找不到交接 ${taskId} —— taskId 见 /handoffs]\n`));
+          return;
+        }
+        if (!rec.thread) {
+          ctx.out(red(`[交接 ${taskId} 没有 thread（M3 之前的记录），无法续跑]\n`));
+          return;
+        }
+        if (rec.from !== from) {
+          ctx.out(red(`[${from} 不能续 ${rec.from} 发起的子会话 ${taskId}]\n`));
+          return;
+        }
+        const spec = getAgent(rec.to);
+        if (!spec) {
+          ctx.out(red(`[记录里的目标身份 ${rec.to} 不认识]\n`));
+          return;
+        }
+        const token = from === 'A' ? null : (ctx.ledger.liveTokens(from)[0] ?? null);
+        const budget = token ? Math.max(remaining(token), 1) : 4000;
+        ctx.out(bold(`[续跑 ${from} → ${spec.id}｜${spec.title}｜task ${taskId}｜预算 ${fmtInt(budget)} token]`));
+        const res = await continueSubagent({
+          as: spec.id,
+          from,
+          owner: rec.from as AgentId,
+          token,
+          thread: rec.thread,
+          taskId,
+          text,
+          budgetTokens: budget,
+          deps: {
+            runner: ctx.agent,
+            ledger: ctx.ledger,
+            module: getModule(spec.home) ?? getModule(DEFAULT_MODULE)!,
+            tail: ctx.state.tail,
+          },
+          onChunk: (s) => process.stdout.write(s),
+        });
+        ctx.out();
+        if (!res.ok) {
+          ctx.out(red(`[续跑未通过：${res.notes ?? '（无说明）'}]\n`));
+          return;
+        }
+        const flag = res.budgetHit ? red('（熔断）') : '';
+        ctx.out(green(`[${spec.id} 完成${flag} · ${fmtInt(res.tokens)} token · ${fmtUsd(res.costUsd)}]`));
+        ctx.out(res.output ?? dim('（无可见输出）'));
+        ctx.out();
+        return;
+      }
+
+      const to = first.toUpperCase();
       const goal = args.slice(1).join(' ').trim();
       const spec = getAgent(to);
       if (!spec) {
@@ -889,7 +975,6 @@ export const COMMANDS: Command[] = [
         ctx.out('[用法：/delegate C 修掉越界读]\n');
         return;
       }
-      const from = currentAgent(ctx.state);
       if (from === to) {
         ctx.out(red('[不能借调自己]\n'));
         return;

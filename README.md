@@ -66,15 +66,15 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `search` | `grep` `glob` | 正则搜内容 / 通配符列文件（不跟符号链接，带 200ms 正则软超时） |
 | `calc` | `calculator` | 无副作用，不进网关 |
 | `shell` | `bash` | **默认全拒**，见「沙箱」一节 |
-| `delegate` | `delegate` | 借调（令牌 + 预算闸门） |
+| `delegate` | `delegate` | 借调 / 在同一子会话里续跑（令牌 + 预算闸门） |
 | `web` `skill` | — | 只声明，还没实现（贡献 0 token） |
 
 各身份每轮为工具 schema 付的钱（`/caps` 随时可查）：
 
 | 身份 | 工具数 | 字符/轮 |
 |---|---|---|
-| A 主控 | 8 | 2962 |
-| B 侦察 | 7 | 2719 |
+| A 主控 | 8 | 3070 |
+| B 侦察 | 7 | 2827 |
 | C 修复 | 4 | 1312 |
 | D 审计 | 6 | 2109 |
 
@@ -171,11 +171,11 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `/modules` `/use <id>` | 列模块 / 切模块（压栈） |
 | `/stack` `/pop` | 看模块栈 / 弹一层 |
 | `/as A\|B\|C\|D` | 切身份（调试用） |
-| `/delegate <身份> <目标>` | 把任务交给另一个身份 |
-| `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录 |
+| `/delegate <身份> <目标>` ／ `/delegate --continue <taskId> <追加>` | 交办一次 / 续跑同一子会话（taskId 见 `/handoffs`） |
+| `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录（记录里带子会话 thread） |
 | `/tail on\|off` `/status on\|off` | 尾部角色片开关 / 底部状态行开关 |
 | `/new` `/history` | 开新会话（冷缓存） / 存档点 |
-| `/anatomy` `/misscheck` `/lenstat` `/ledger` `/thinktest` | 诊断类（`/help all` 才列） |
+| `/anatomy` `/misscheck` `/lenstat` `/ledger [n\|agents]` `/thinktest` | 诊断类（`/help all` 才列；`/ledger agents` 按身份核账） |
 
 底部常驻一行，宽度不够从右往左丢段、绝不换行：
 
@@ -214,7 +214,7 @@ ledger(ts, day, run_id, thread_id, model, band, tag, module, calls,
        target, verdict, reason)        -- v3：能力网关的判罚行（tag='policy'）
 ```
 
-另外三张表：`tokens`（授权令牌）、`handoffs`（交接记录）。
+另外三张表：`tokens`（授权令牌）、`handoffs`（交接记录，v3 M3 起带子会话 `thread` —— 续跑靠它回到同一个 checkpoint）。
 
 `/misscheck` 会逐对检查几何律在你的真实数据上是否仍然成立 —— 这是唯一能证明「前缀缓存真的命中了」的手段，比任何猜测都硬。
 
@@ -237,10 +237,11 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v3 M2 capability 层 + 能力网关（L1 policy）+ 判罚落账
 - [x] v3 M2.5 实用化四件：`edit_file`、循环护栏、上下文压缩、`bash`
 - [x] v3 M2.6 沙箱加固：子进程 env 最小化、路径解析真实路径
-- [ ] v3 M3 A→B 往返（子会话可续）、并行借调、按 agent 核账
+- [x] v3 M3.1 子会话可续（父驱动往返）+ 按 agent 核账（`/ledger agents`）
+- [ ] v3 M3.5 并行借调、B 主动反问 A、`@` 寻址
 - [ ] 以后：`web` / MCP / skill / 多 provider；容器级隔离
 
-设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN）。
+设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。
 
 ## License
 

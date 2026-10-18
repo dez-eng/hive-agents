@@ -30,11 +30,15 @@ interface FakeTurn {
 class FakeChat extends BaseChatModel {
   calls = 0;
   constructor(
-    private readonly turns: FakeTurn[],
+    private turns: FakeTurn[],
     private readonly inTok = 100,
     private readonly outTok = 20,
   ) {
     super({});
+  }
+  /** v3 M3：测试里第二轮才拿得到 taskId，所以支持跑完首轮再追加剧本 */
+  add(t: FakeTurn): void {
+    this.turns.push(t);
   }
   _llmType(): string {
     return 'fake';
@@ -203,6 +207,86 @@ test('v3 M2：身份没装的能力，调它 → 被门挡住，子任务不跑'
 
     assert.equal(runner.seen.length, 0, 'D 没装 delegate 能力，子任务不该跑');
     assert.equal(led.recentHandoffs(1).length, 0);
+  } finally {
+    led.close();
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* Windows 下偶尔删不掉 */
+    }
+  }
+});
+
+test('v3 M3：delegate(resume) → 同一子 thread 续跑，task 留两行、令牌继续扣', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hive-del3-'));
+  const led = new Ledger(join(dir, 't.db'));
+  led.open();
+  try {
+    const chat = new FakeChat([{ content: '', toolCalls: [DEL] }, { content: '首跑完成' }]);
+    const runner = new FakeRunner();
+    const token = mkToken('B', 500);
+    led.saveToken(token);
+    const agent = new HiveAgent({ model: 'deepseek-flash', memoryPath: join(dir, 'm.db'), chat });
+
+    const delegate: DelegateContext = {
+      ledger: led,
+      thread: 'main',
+      from: 'B',
+      token,
+      runner,
+      moduleOf: (as) => getModule(AGENTS[as].home)!,
+      tail: true,
+      seq: () => 1,
+    };
+
+    await agent.run({
+      text: '看看这个越界读',
+      threadId: 'main',
+      module: getModule('recon')!,
+      tail: false,
+      delegate,
+      agent: 'B',
+    });
+
+    const first = led.recentHandoffs(1)[0]!;
+    assert.equal(first.from, 'B');
+    assert.equal(first.to, 'C');
+    assert.ok(first.thread.startsWith('main#C#t001-'), '首跑把 thread 落库');
+
+    // 第二轮：模型带 resume 回到同一个子会话
+    chat.add({
+      content: '',
+      toolCalls: [
+        {
+          name: 'delegate',
+          args: { to: 'C', goal: '再看一下第二个调用点', budgetTokens: 200, resume: first.taskId },
+          id: 'd2',
+        },
+      ],
+    });
+    chat.add({ content: '续跑完成' });
+
+    const res = await agent.run({
+      text: '再问一句',
+      threadId: 'main',
+      module: getModule('recon')!,
+      tail: false,
+      delegate,
+      agent: 'B',
+    });
+
+    assert.equal(res.text, '续跑完成');
+    assert.equal(runner.seen.length, 2);
+    assert.equal(runner.seen[1]!.threadId, runner.seen[0]!.threadId, '同一子会话');
+    assert.equal(runner.seen[1]!.text, '再看一下第二个调用点', '续跑发的是追问原文');
+    assert.equal(runner.seen[1]!.agent, 'C');
+
+    const hos = led.recentHandoffs(2);
+    assert.equal(hos.length, 2);
+    assert.equal(hos[0]!.taskId, first.taskId, '同一 task');
+    assert.equal(hos[0]!.goal, '[续跑] 再看一下第二个调用点');
+    assert.equal(hos[0]!.thread, first.thread);
+    assert.equal(led.loadToken(token.id)!.spent, 240, '首跑 120 + 续跑 120');
   } finally {
     led.close();
     try {

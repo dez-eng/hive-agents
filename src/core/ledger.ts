@@ -109,6 +109,12 @@ export interface LedgerTotals {
   rows: number;
 }
 
+/** v3 M3：按身份汇总 —— 「每个 agent 自己跑时命中率与成本如何」 */
+export interface AgentTotals extends LedgerTotals {
+  /** '' = M3 之前没标身份的老行（展示层写成「未标记」，不丢弃） */
+  agent: string;
+}
+
 /** 一次交接的记录 —— 交接走 schema，落库也只落结构化字段 */
 export interface HandoffRecord {
   id?: number;
@@ -125,6 +131,11 @@ export interface HandoffRecord {
   budgetHit: boolean;
   notes?: string;
   output?: string;
+  /**
+   * v3 M3：子会话 thread —— 续跑靠它回到同一个 checkpoint。
+   * M3 之前的老记录没有这一列（空串），明确报「无法续跑」，不猜。
+   */
+  thread?: string;
 }
 
 /** 整段压成一行，取前 n 字 —— 用来在账本里认出「这轮问了什么、答了什么」 */
@@ -194,6 +205,27 @@ export function kBlocksOf(inTok: number, cacheHit: number): number {
 
 export function missOf(inTok: number, cacheHit: number): number {
   return Math.max(inTok - cacheHit, 0);
+}
+
+/** v3 M3：handoffs 行 → 结构化记录（含续跑要用的 thread） */
+function mapHandoff(r: Record<string, unknown>): HandoffRecord {
+  return {
+    id: num(r['id']),
+    ts: str(r['ts']),
+    taskId: str(r['task_id']),
+    from: str(r['from_agent']),
+    to: str(r['to_agent']),
+    goal: str(r['goal']),
+    expect: str(r['expect']),
+    budgetTok: num(r['budget_tok']),
+    tokens: num(r['tokens']),
+    costUsd: num(r['cost_usd']),
+    ok: bool(r['ok']),
+    budgetHit: bool(r['budget_hit']),
+    notes: str(r['notes']),
+    output: str(r['output_head']),
+    thread: str(r['thread']),
+  };
 }
 
 function tokenFromRow(r: Record<string, unknown>): Token {
@@ -331,9 +363,17 @@ export class Ledger {
           ok          INTEGER NOT NULL DEFAULT 1,
           budget_hit  INTEGER NOT NULL DEFAULT 0,
           notes       TEXT    NOT NULL DEFAULT '',
-          output_head TEXT    NOT NULL DEFAULT ''
+          output_head TEXT    NOT NULL DEFAULT '',
+          thread      TEXT    NOT NULL DEFAULT ''
         )
       `);
+      // v3 M3：老库补 thread 列（已经建好的 handoffs 表没有它）
+      const hcols = new Set(
+        db.prepare('PRAGMA table_info(handoffs)').all().map((r) => str(r['name'])),
+      );
+      if (!hcols.has('thread')) {
+        db.exec("ALTER TABLE handoffs ADD COLUMN thread TEXT NOT NULL DEFAULT ''");
+      }
       db.exec('CREATE INDEX IF NOT EXISTS idx_ho_task ON handoffs(task_id)');
 
       this.db = db;
@@ -569,6 +609,52 @@ export class Ledger {
     }
   }
 
+  /**
+   * v3 M3：按 agent 汇总。只统计 tag='turn' —— policy 行不是消费。
+   * agent='' 的老行原样保留（展示层标「未标记」），不丢历史账。
+   */
+  byAgent(scope: { day?: string; runId?: string; threadId?: string } = {}): AgentTotals[] {
+    if (!this.db) return [];
+    try {
+      const where: string[] = ["tag = 'turn'"];
+      const args: unknown[] = [];
+      if (scope.day) {
+        where.push('day = ?');
+        args.push(scope.day);
+      }
+      if (scope.runId) {
+        where.push('run_id = ?');
+        args.push(scope.runId);
+      }
+      if (scope.threadId) {
+        where.push('thread_id = ?');
+        args.push(scope.threadId);
+      }
+      const sql =
+        'SELECT agent, COALESCE(SUM(calls),0) AS calls, COALESCE(SUM(in_tok),0) AS in_tok,' +
+        ' COALESCE(SUM(cache_hit),0) AS cache_hit, COALESCE(SUM(out_tok),0) AS out_tok,' +
+        ' COALESCE(SUM(reason_tok),0) AS reason_tok, COALESCE(SUM(cost_usd),0) AS cost_usd,' +
+        ' COUNT(*) AS rows FROM ledger WHERE ' +
+        where.join(' AND ') +
+        ' GROUP BY agent ORDER BY agent';
+      return this.db
+        .prepare(sql)
+        .all(...args)
+        .map((r) => ({
+          agent: str(r['agent']),
+          calls: num(r['calls']),
+          inTok: num(r['in_tok']),
+          cacheHit: num(r['cache_hit']),
+          outTok: num(r['out_tok']),
+          reasoning: num(r['reason_tok']),
+          costUsd: num(r['cost_usd']),
+          rows: num(r['rows']),
+        }));
+    } catch {
+      return [];
+    }
+  }
+
   days(limit = 7): Array<{ day: string } & LedgerTotals> {
     if (!this.db) return [];
     try {
@@ -680,8 +766,8 @@ export class Ledger {
       const res = this.db
         .prepare(
           'INSERT INTO handoffs (task_id, ts, day, from_agent, to_agent, goal, expect,' +
-            ' budget_tok, tokens, cost_usd, ok, budget_hit, notes, output_head)' +
-            ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ' budget_tok, tokens, cost_usd, ok, budget_hit, notes, output_head, thread)' +
+            ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         )
         .run(
           h.taskId,
@@ -698,6 +784,7 @@ export class Ledger {
           h.budgetHit ? 1 : 0,
           h.notes ?? '',
           head(h.output, 80),
+          h.thread ?? '',
         );
       const id = res.lastInsertRowid;
       return typeof id === 'number' ? id : null;
@@ -712,24 +799,25 @@ export class Ledger {
       return this.db
         .prepare('SELECT * FROM handoffs ORDER BY id DESC LIMIT ?')
         .all(limit)
-        .map((r) => ({
-          id: num(r['id']),
-          ts: str(r['ts']),
-          taskId: str(r['task_id']),
-          from: str(r['from_agent']),
-          to: str(r['to_agent']),
-          goal: str(r['goal']),
-          expect: str(r['expect']),
-          budgetTok: num(r['budget_tok']),
-          tokens: num(r['tokens']),
-          costUsd: num(r['cost_usd']),
-          ok: bool(r['ok']),
-          budgetHit: bool(r['budget_hit']),
-          notes: str(r['notes']),
-          output: str(r['output_head']),
-        }));
+        .map(mapHandoff);
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * v3 M3：按 task 找最近一次交接 —— 续跑要拿 thread / from / to。
+   * 同一 task 可以有多行（首跑 + 每次续跑），最近的才是当前会话。
+   */
+  findHandoff(taskId: string): HandoffRecord | null {
+    if (!this.db) return null;
+    try {
+      const r = this.db
+        .prepare('SELECT * FROM handoffs WHERE task_id=? ORDER BY id DESC LIMIT 1')
+        .get(taskId);
+      return r ? mapHandoff(r) : null;
+    } catch {
+      return null;
     }
   }
 

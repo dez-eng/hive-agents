@@ -113,6 +113,42 @@ test('/delegate 拒绝非法目标与空目标', async () => {
   });
 });
 
+test('/delegate --continue：复用同一子会话，task 不变', async () => {
+  await withLedger(async (led) => {
+    const { ctx, lines, runner } = makeCtx(led, new FakeRunner(), ['assistant']);
+    await findCommand('/delegate')!.run(ctx, ['C', '修掉越界读']);
+    const first = led.recentHandoffs(1)[0]!;
+    assert.ok(first.thread, '首跑落 thread');
+
+    lines.length = 0;
+    await findCommand('/delegate')!.run(ctx, ['--continue', first.taskId, '再看一下']);
+    assert.equal(runner.seen.length, 2);
+    assert.equal(runner.seen[1]!.threadId, runner.seen[0]!.threadId, '同一子会话');
+    assert.equal(runner.seen[1]!.text, '再看一下');
+    assert.ok(lines.join('\n').includes('续跑'));
+
+    const hos = led.recentHandoffs(2);
+    assert.equal(hos[0]!.taskId, first.taskId);
+    assert.equal(hos[0]!.goal, '[续跑] 再看一下');
+  });
+});
+
+test('/delegate --continue 拒绝非发起方', async () => {
+  await withLedger(async (led) => {
+    const { ctx, lines, runner } = makeCtx(led, new FakeRunner(), ['assistant']);
+    await findCommand('/delegate')!.run(ctx, ['C', '修掉越界读']);
+    const first = led.recentHandoffs(1)[0]!;
+
+    // 换成 C 的身份（栈底放 fix 模块）
+    ctx.state.stack = ['fix'];
+    lines.length = 0;
+    await findCommand('/delegate')!.run(ctx, ['--continue', first.taskId, '我接着改']);
+
+    assert.equal(runner.seen.length, 1, '只有首跑那一次');
+    assert.ok(lines.join('\n').includes('不能续'));
+  });
+});
+
 test('/budget 与 /handoffs 不炸，且在空库时给人话', async () => {
   await withLedger(async (led) => {
     const { ctx, lines } = makeCtx(led, new FakeRunner());

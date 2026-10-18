@@ -1,5 +1,5 @@
 /**
- * runSubagent —— v2 §3 / §5 的运行时，把「借调」这件事真正跑起来。
+ * runSubagent / continueSubagent —— v2 §3 / §5 的运行时，把「借调」这件事真正跑起来。
  *
  * 四件事按顺序发生，顺序本身就是设计：
  *   1. **执行层授权**（grant.ts 的 authorizeDelegate）：身份表 → 令牌归属 → 令牌内容。
@@ -9,6 +9,10 @@
  *   3. **独立 thread**（handoff.ts 的 subThread）：B/C/D 拿不到 A 的历史。
  *      「无状态」不是嘴上说的，是 checkpoint 物理隔离。
  *   4. **只递结构化切片 + 记账留痕**（renderSlice / logTurn / insertHandoff）。
+ *
+ * v3 M3 把「一次性交办」升级为**可续会话**：首跑由 runSubagent 派生 thread，
+ * 续跑由 continueSubagent 原样复用同一个 thread —— 子 agent 因此看得到自己上一轮。
+ * 两条路共用 execute()：授权、记账、扣令牌、落 handoffs 完全同一条。
  *
  * 契约：runner 只需实现 run()。生产线传 HiveAgent，测试传假 runner —— 零 API。
  */
@@ -66,35 +70,61 @@ export function renderSlice(input: HandoffInput): string {
   return [`目标：${input.goal}`, `输入切片：\n${input.slice}`, `期望产物：${input.expect}`].join('\n');
 }
 
-/** 把子任务这一轮记进账本：agent 栏写 as，task_id 带上，便于事后对账 */
+/** 把这一轮记进账本：agent 栏写 as，task_id 带上，便于事后对账 */
 function logTurn(
-  o: RunSubagentOptions,
+  as: AgentId,
+  taskId: string,
+  module: AgentModule,
+  ledger: Ledger,
   meter: TokenMeter,
   thread: string,
   budget: number,
   budgetHit: boolean,
 ): void {
-  o.deps.ledger.insert({
+  ledger.insert({
     kind: 'turn',
     threadId: thread,
-    module: o.deps.module.id,
+    module: module.id,
     calls: meter.calls,
     inTok: meter.inTok,
     cacheHit: meter.cacheHit,
     outTok: meter.outTok,
     reasoning: meter.reasoning,
     costUsd: meter.cost(),
-    agent: o.as,
-    taskId: o.input.taskId,
+    agent: as,
+    taskId,
     budgetTok: budget,
     budgetHit: budgetHit ? 1 : 0,
     band: meter.band,
   });
 }
 
-export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult> {
+/**
+ * 首跑与续跑共用的执行核。
+ * 「thread 怎么来」「输入文本怎么来」由调用方决定，其余完全一致。
+ */
+interface ExecuteOptions {
+  as: AgentId;
+  from: AgentId;
+  token: Token | null;
+  /** 现成的子会话 thread（首跑由 runSubagent 派生，续跑原样复用） */
+  thread: string;
+  taskId: string;
+  /** 这一步发给子 agent 的文本（首跑是 renderSlice，续跑是追加原文） */
+  text: string;
+  /** 落 handoffs 的摘要 */
+  goal: string;
+  expect: string;
+  budgetTokens: number;
+  deps: RunSubagentDeps;
+  onChunk?: (piece: string) => void;
+  /** A 借调时自动签发子令牌（续跑同一策略：新签一张，旧的自然过期） */
+  issueChildToken: boolean;
+}
+
+async function execute(o: ExecuteOptions): Promise<HandoffResult> {
   const now = (o.deps.now ?? Date.now)();
-  const budget = o.input.budgetTokens;
+  const budget = o.budgetTokens;
 
   // 1. 执行层授权 —— 没过就返回结构化失败，不进模型、不花钱
   const verdict = authorizeDelegate({
@@ -105,24 +135,19 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
     now,
   });
   if (!verdict.ok) {
-    return { taskId: o.input.taskId, ok: false, tokens: 0, costUsd: 0, budgetHit: false, notes: verdict.reason };
+    return { taskId: o.taskId, ok: false, tokens: 0, costUsd: 0, budgetHit: false, notes: verdict.reason };
   }
-
-  // 2. 独立 thread。子 agent 读的是自己的 checkpoint，与发起方的历史物理隔离
-  const thread = subThread(o.thread, o.as, o.input.taskId);
 
   // §4：A 借调时自动签发 —— 让被借调者拿到令牌，并给它一层借调上下文，
   // 于是 A→B→C 的嵌套能在子任务里继续（B 拿这张令牌去借调 C/D）。
   let childDelegate: DelegateContext | undefined;
-  if (o.from === 'A') {
+  if (o.issueChildToken && o.from === 'A') {
     const issued = issueToken(o.as, { budgetTokens: budget, note: 'A 自动签发' });
     if (issued.ok) {
       o.deps.ledger.saveToken(issued.token);
-      childDelegate = o.deps.makeChildDelegate?.(issued.token, thread);
+      childDelegate = o.deps.makeChildDelegate?.(issued.token, o.thread);
     }
   }
-
-  const text = renderSlice(o.input);
 
   let tokens = 0;
   let costUsd = 0;
@@ -133,8 +158,8 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
 
   try {
     const req: TurnRequest = {
-      text,
-      threadId: thread,
+      text: o.text,
+      threadId: o.thread,
       module: o.deps.module,
       tail: o.deps.tail,
       budgetTokens: budget,
@@ -142,7 +167,7 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
       // 判罚也落在同一个账本上（带上 taskId 便于对账）
       agent: o.as,
       ledger: o.deps.ledger,
-      taskId: o.input.taskId,
+      taskId: o.taskId,
       ...(childDelegate ? { delegate: childDelegate } : {}),
     };
     const res = await o.deps.runner.run(req, o.onChunk);
@@ -151,7 +176,7 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
     budgetHit = res.budgetHit;
     if (res.text) output = res.text;
     if (budgetHit) notes = '被预算闸门熔断';
-    logTurn(o, res.meter, thread, budget, budgetHit);
+    logTurn(o.as, o.taskId, o.deps.module, o.deps.ledger, res.meter, o.thread, budget, budgetHit);
   } catch (e) {
     if (isBudgetExceeded(e)) {
       // runner 直接把熔断抛出来了（没在内部兜住）—— 一样算熔断，一样留痕
@@ -165,15 +190,18 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
 
   // 3. 扣令牌 + 落 handoffs（痕迹策略：checkpoint 弃、这张表留）
   if (o.token && tokens > 0) {
-    const next = debitToken(o.token, tokens);
+    // 从账本读当前 spent 再扣：同一个令牌对象会被多轮续跑复用，
+    // 拿内存里的旧值算会覆盖掉上一轮（首跑 120 + 续跑 120 变成 120）。
+    const current = o.deps.ledger.loadToken(o.token.id) ?? o.token;
+    const next = debitToken(current, tokens);
     o.deps.ledger.updateTokenSpent(next.id, next.spent);
   }
   o.deps.ledger.insertHandoff({
-    taskId: o.input.taskId,
+    taskId: o.taskId,
     from: o.from,
     to: o.as,
-    goal: o.input.goal,
-    expect: o.input.expect,
+    goal: o.goal,
+    expect: o.expect,
     budgetTok: budget,
     tokens,
     costUsd,
@@ -181,15 +209,99 @@ export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult>
     budgetHit,
     ...(notes ? { notes } : {}),
     ...(output ? { output } : {}),
+    thread: o.thread,
   });
 
   return {
-    taskId: o.input.taskId,
+    taskId: o.taskId,
     ok,
     ...(output ? { output } : {}),
     tokens,
     costUsd,
     budgetHit,
     ...(notes ? { notes } : {}),
+    thread: o.thread,
   };
+}
+
+export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult> {
+  return execute({
+    as: o.as,
+    from: o.from,
+    token: o.token,
+    thread: subThread(o.thread, o.as, o.input.taskId),
+    taskId: o.input.taskId,
+    text: renderSlice(o.input),
+    goal: o.input.goal,
+    expect: o.input.expect,
+    budgetTokens: o.input.budgetTokens,
+    deps: o.deps,
+    ...(o.onChunk ? { onChunk: o.onChunk } : {}),
+    issueChildToken: o.from === 'A',
+  });
+}
+
+export interface ContinueSubagentOptions {
+  /** 子会话身份（= 原子任务的 to） */
+  as: AgentId;
+  /** 这次是谁在续 */
+  from: AgentId;
+  /** 原子任务的发起方（handoff.from）—— 只有它能续 */
+  owner: AgentId;
+  token: Token | null;
+  /** 原样复用，不重新派生 */
+  thread: string;
+  taskId: string;
+  /** 追加给子 agent 的话 */
+  text: string;
+  budgetTokens: number;
+  deps: RunSubagentDeps;
+  onChunk?: (piece: string) => void;
+}
+
+/**
+ * v3 M3：在同一个子会话里接着跑一轮。
+ *
+ * 与 runSubagent 的区别只有两处：thread 是现成的、输入是追加原文而不是结构化切片。
+ * 授权仍走同一条闸；归属检查放在最前面（挡在花钱之前）。
+ */
+export async function continueSubagent(o: ContinueSubagentOptions): Promise<HandoffResult> {
+  if (o.from !== o.owner) {
+    return {
+      taskId: o.taskId,
+      ok: false,
+      tokens: 0,
+      costUsd: 0,
+      budgetHit: false,
+      notes: `${o.from} 不能续 ${o.owner} 发起的子会话 ${o.taskId}`,
+    };
+  }
+  if (!o.thread) {
+    return {
+      taskId: o.taskId,
+      ok: false,
+      tokens: 0,
+      costUsd: 0,
+      budgetHit: false,
+      notes: `交接 ${o.taskId} 没有 thread（M3 之前的记录），无法续跑`,
+    };
+  }
+  const text = o.text.trim();
+  if (!text) {
+    return { taskId: o.taskId, ok: false, tokens: 0, costUsd: 0, budgetHit: false, notes: '续跑内容为空' };
+  }
+  return execute({
+    as: o.as,
+    from: o.from,
+    token: o.token,
+    thread: o.thread,
+    taskId: o.taskId,
+    text,
+    goal: `[续跑] ${text}`,
+    expect: '续跑',
+    budgetTokens: o.budgetTokens,
+    deps: o.deps,
+    ...(o.onChunk ? { onChunk: o.onChunk } : {}),
+    issueChildToken: o.from === 'A',
+  });
 }
