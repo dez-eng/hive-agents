@@ -26,6 +26,7 @@ import {
   type AnyTool,
 } from './capability.js';
 import { VERSION } from './config.js';
+import { debug } from './debug.js';
 import type { McpServerConfig } from './settings.js';
 
 export interface McpServerStatus {
@@ -156,15 +157,18 @@ export async function connectMcp(
         // server 的 stderr 不直接倒进 REPL；失败原因从异常里拿
         stderr: 'pipe',
       });
+      debug('mcp', 'connect', { server: name, command: cfg.command });
       await client.connect(transport);
       const listed = await client.listTools();
       const list = listed.tools ?? [];
       for (const t of list) tools.push(wrapMcpTool(client, name, t));
       clients.push(client);
       status.push({ name, tools: list.length });
+      debug('mcp', 'ready', { server: name, tools: list.length });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       status.push({ name, tools: 0, error: msg });
+      debug('mcp', 'connect-failed', { server: name, error: msg });
       warn(`[MCP ${name} 连接失败：${msg}]`);
       try {
         await client.close();

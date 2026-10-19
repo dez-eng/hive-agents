@@ -35,6 +35,7 @@ import { ChatDeepSeek } from '@langchain/deepseek';
 
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
 import { baseUrl, compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
+import { debug } from './debug.js';
 import type { Token } from './grant.js';
 import { makeTaskId, parseHandoffInput, type HandoffInput, type HandoffResult } from './handoff.js';
 import type { Ledger } from './ledger.js';
@@ -88,6 +89,8 @@ export interface TurnRequest {
   tail: boolean;
   /** v2：这一轮的 token 预算闸门。0 / 不传 = 无闸门 */
   budgetTokens?: number;
+  /** v4 M4.3：中止信号 —— Ctrl+C 只停当前轮，不杀会话 */
+  signal?: AbortSignal;
   /** v2：借调上下文。不传 = 这一轮里 delegate 不可用 */
   delegate?: DelegateContext;
   /**
@@ -490,7 +493,9 @@ function actionTarget(name: string, args: Record<string, unknown>): string {
     case 'edit_file':
       return pick('path');
     case 'glob':
-      return pick('pattern');
+      // pattern 不是路径：工具层从 roots 遍历、pattern 只做相对路径匹配。
+      // 拿 pattern 去做 realpath 会把 `src/**/*.ts` 误判成越界（真机踩到过）。
+      return '.';
     case 'bash':
       return pick('command');
     case 'delegate':
@@ -598,6 +603,13 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     if (packed.dropped > 0) runtime.compacted += packed.dropped;
 
     const messages = [new SystemMessage(STABLE_PREFIX), ...packed.messages];
+    debug('model', 'invoke', {
+      agent: runtime.agent,
+      think: runtime.think,
+      threadId: runtime.threadId,
+      messages: messages.length,
+      prevInTok: runtime.prevInTok,
+    });
     const reply = await bound[runtime.agent][runtime.think].invoke(messages);
     return { messages: [reply] };
   };
@@ -618,6 +630,11 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
 
     for (const call of calls) {
       const name = call.name;
+      debug('tool', name, {
+        agent,
+        threadId: runtime.threadId,
+        ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+      });
       const fn = TOOL_MAP[name] as
         | { invoke: (input: unknown) => Promise<unknown> }
         | undefined;
@@ -758,6 +775,8 @@ export class HiveAgent {
         callbacks: [meter],
         streamMode: 'messages' as const,
         recursionLimit: steps > 0 ? steps * 2 + 6 : 1000,
+        // v4 M4.3：中止信号沿 config 传到模型请求与工具执行
+        ...(req.signal ? { signal: req.signal } : {}),
       };
 
       let text = '';

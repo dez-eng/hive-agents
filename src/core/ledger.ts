@@ -17,6 +17,7 @@ import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { BLOCK, ledgerPath, modelName } from './config.js';
+import { debug } from './debug.js';
 import type { Token } from './grant.js';
 
 const requireNative = createRequire(import.meta.url);
@@ -272,6 +273,9 @@ export class Ledger {
       mkdirSync(dirname(target), { recursive: true });
       const sqlite = requireNative('node:sqlite') as SqliteModule;
       const db = new sqlite.DatabaseSync(target);
+      // v4 M4.3：多实例并发时，写冲突最多等 5 秒再报 busy（而不是立刻抛）
+      db.exec('PRAGMA busy_timeout = 5000');
+      debug('ledger', 'open', { path: target });
       db.exec(`
         CREATE TABLE IF NOT EXISTS ledger (
           id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -689,6 +693,17 @@ export class Ledger {
       return v || null;
     } catch {
       return null;
+    }
+  }
+
+  /** v4 M4.3：诊断用 —— 当前 busy_timeout（毫秒）；0 = 没打开或设不上 */
+  busyTimeout(): number {
+    if (!this.db) return 0;
+    try {
+      const r = this.db.prepare('PRAGMA busy_timeout').get();
+      return Number(r?.['timeout'] ?? 0);
+    } catch {
+      return 0;
     }
   }
 

@@ -47,6 +47,7 @@ export function parse(argv: string[]): Parsed {
   if (first === '--help' || first === '-h' || first === 'help') return { mode: 'help', rest: tail, as, cont };
   if (first === '--version' || first === '-v' || first === 'version') return { mode: 'version', rest: tail, as, cont };
   if (first === 'doctor') return { mode: 'doctor', rest: tail, as, cont };
+  if (first === 'init') return { mode: 'init', rest: tail, as, cont };
   if (first === 'run') return { mode: 'run', rest: tail, as, cont };
   return { mode: 'run', rest, as, cont };
 }

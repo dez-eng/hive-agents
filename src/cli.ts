@@ -14,6 +14,8 @@ silenceSqliteWarning();
 
 import { APP_NAME, VERSION, hasApiKey, loadDotEnv, modelName, toolSteps, turnBudget } from './core/config.js';
 import { parsePriceOverlay, setPriceOverlay } from './core/cost.js';
+import { classifyError } from './core/errors.js';
+import { initFiles } from './core/init.js';
 import { activateMcp, connectMcp, setMcpSummary, type McpConnection } from './core/mcp.js';
 import { setMcpAllowServers } from './core/policy.js';
 import { loadSettings } from './core/settings.js';
@@ -32,6 +34,7 @@ const USAGE = `${APP_NAME} ${VERSION} —— 缓存友好型 agent CLI
   ${APP_NAME} --continue           续上一次独立会话（独立会话本就可续，这只是一个显式说法）
   ${APP_NAME} run <问题>           单轮问答（脚本用），结果写 stdout
   ${APP_NAME} --as B run <问题>    以 B 身份单轮
+  ${APP_NAME} init                 生成 .env.example / .hive/policy.json / hive.config.example.json
   ${APP_NAME} doctor               环境自检
   ${APP_NAME} --version            版本
   ${APP_NAME} --help               这份帮助
@@ -74,6 +77,17 @@ async function main(): Promise<number> {
   }
   if (mode === 'version') {
     process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
+
+  // v4 M4.3：init 不需要 key / 不需要连 MCP —— 只生成模板
+  if (mode === 'init') {
+    const force = rest.includes('--force') || rest.includes('-f');
+    const r = initFiles(process.cwd(), { force });
+    process.stdout.write(`[${APP_NAME} init · ${process.cwd()}]\n`);
+    for (const p of r.written) process.stdout.write(`  写入 ${p}\n`);
+    for (const p of r.skipped) process.stdout.write(`  跳过 ${p}（已存在；--force 覆盖）\n`);
+    process.stdout.write('下一步：把 .env.example 复制成 .env 填 key → hive doctor\n');
     return 0;
   }
 
@@ -162,9 +176,11 @@ async function main(): Promise<number> {
       await mcp?.close();
       return 0;
     } catch (e) {
-      process.stderr.write(`调用失败：${e instanceof Error ? e.message : String(e)}\n`);
+      const c = classifyError(e);
+      process.stderr.write(`[${c.title}] ${c.message}\n`);
+      if (c.hint) process.stderr.write(`  ${c.hint}\n`);
       await mcp?.close();
-      return 1;
+      return c.kind === 'abort' ? 130 : 1;
     }
   }
 

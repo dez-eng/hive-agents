@@ -33,6 +33,7 @@ printf 'DEEPSEEK_API_KEY=sk-你的key\n' > .env
 
 ```bash
 hive                      # 交互会话（主控 A）
+hive init                 # 生成 .env.example / .hive/policy.json / hive.config.example.json
 hive --as B               # 以侦察身份独立启动；会话挂在 solo#B 上，可以续
 hive --as C --continue    # 续 C 上一次的独立会话
 hive run "3*7 等于几"      # 单轮，适合脚本
@@ -231,6 +232,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `DEEPSEEK_BASE_URL` | — | 自定义 DeepSeek 兼容端点（不设走官方） |
 | `HIVE_PRICE_JSON` | — | 覆盖内置价表（JSON；写坏退回内置价） |
 | `HIVE_POLICY_MCP` | — | MCP server 白名单（逗号分隔；优先于配置文件） |
+| `HIVE_DEBUG` | 空 | `1` 时输出 model/tool/mcp/ledger 调试日志到 stderr |
 
 ## 账本
 
@@ -270,9 +272,10 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v3 M3.1 子会话可续（父驱动往返）+ 按 agent 核账（`/ledger agents`）
 - [x] v4 M4.1 协调：并行借调（`parallel`）+ 每 run 独立 runtime + `/tasks`
 - [x] v4 M4.2a 扩展：MCP（stdio + 动态工具 + policy）+ DeepSeek 配置化
+- [x] v4 M4.3 可工作：Ctrl+C 只停当前轮、错误分类、`hive init`、busy_timeout、`HIVE_DEBUG`
 - [ ] v4 M4.2b 扩展：`skill` / `web`
 - [ ] v3 M3.5 剩余：B 主动反问 A、`@` 寻址
-- [ ] v4 M4.3 可工作（中断、init、CI）；M4.4 发布
+- [ ] v4 M4.4 发布：CI / CHANGELOG / npm
 - [ ] 以后：容器级隔离
 
 设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。

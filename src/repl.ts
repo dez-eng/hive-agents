@@ -16,6 +16,7 @@ import { createInterface, type Interface } from 'node:readline';
 
 import { APP_NAME, VERSION, currentBand, ledgerPath, memoryPath, toolSteps, turnBudget } from './core/config.js';
 import { HiveAgent, type DelegateContext, type HiveAgent as AgentType } from './core/agent.js';
+import { classifyError } from './core/errors.js';
 import type { Token } from './core/grant.js';
 import { soloThread } from './core/handoff.js';
 import { Ledger } from './core/ledger.js';
@@ -123,7 +124,7 @@ function banner(ctx: Ctx): void {
 }
 
 /** 一轮真实对话 —— 流式打印、记账、补 footer */
-export async function runTurn(ctx: Ctx, text: string): Promise<void> {
+export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Promise<void> {
   // 当前角色 = 栈顶模块。借调中就是被借调的那个 agent
   const mod = getModule(currentModuleId(ctx.state)) ?? getModule('assistant')!;
   process.stdout.write(`\n${bold('助手')} ${dim('>')} `);
@@ -142,6 +143,8 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
         ledger: ctx.ledger,
         // v3 M2.5：自己聊天的这条路也上闸门（原先只有借调子任务有）
         budgetTokens: turnBudget(),
+        // v4 M4.3：Ctrl+C 中止这一轮
+        ...(signal ? { signal } : {}),
       },
       (piece) => {
         process.stdout.write(piece);
@@ -188,7 +191,9 @@ export async function runTurn(ctx: Ctx, text: string): Promise<void> {
     });
   } catch (e) {
     process.stdout.write('\n');
-    ctx.out(red(`  ── [调用失败 ${e instanceof Error ? e.name : 'Error'}: ${e instanceof Error ? e.message : String(e)}] —— 会话还在，可以继续问`));
+    const c = classifyError(e);
+    ctx.out(red(`  ── [${c.title}] ${c.message}`));
+    if (c.hint) ctx.out(dim(`     ${c.hint}`));
   }
 
   printFooter(ctx);
@@ -205,12 +210,25 @@ export async function startRepl(opts: ContextOptions = {}): Promise<void> {
     terminal: Boolean(process.stdin.isTTY),
   });
 
-  rl.on('SIGINT', () => {
+  let activeAbort: AbortController | null = null;
+
+  const onSigint = (): void => {
+    // v4 M4.3：跑一轮时，第一下 Ctrl+C 只中止这一轮；空闲时才是退出
+    if (activeAbort) {
+      process.stdout.write('\n');
+      ctx.out(red('[正在中止本轮…]'));
+      activeAbort.abort();
+      return;
+    }
     process.stdout.write('\n');
     ctx.out(gray('再见。'));
     rl.close();
     process.exit(0);
-  });
+  };
+
+  rl.on('SIGINT', onSigint);
+  // 非 TTY（管道 / 脚本）下 readline 收不到 OS 信号，用进程级兜底
+  process.on('SIGINT', onSigint);
 
   for await (const line of rl) {
     const raw = line.trim();
@@ -246,14 +264,18 @@ export async function startRepl(opts: ContextOptions = {}): Promise<void> {
     }
 
     rl.pause();
+    const ctl = new AbortController();
+    activeAbort = ctl;
     try {
-      await runTurn(ctx, text);
+      await runTurn(ctx, text, ctl.signal);
     } finally {
+      activeAbort = null;
       rl.resume();
     }
   }
 
   ledger.close();
+  process.off('SIGINT', onSigint);
   ctx.out(gray('再见。'));
 }
 

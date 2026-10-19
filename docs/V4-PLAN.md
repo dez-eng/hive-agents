@@ -19,11 +19,11 @@
 
 | 现状 | 产品级要求 | 差距 |
 |---|---|---|
-| `SIGINT` 直接退出整个进程（`repl.ts:208`） | Ctrl+C 停当前轮，再按一次退出 | 长任务按 Ctrl+C 会丢会话；无 `AbortController` |
-| 模型错误只靠 `maxRetries: 2` | 可见的重试 / 降级 / 明确错误分类 | 429、超时、网络、鉴权混成一句 `调用失败` |
-| 配置只有 `.env` + `.hive/policy.json` | `hive init` 生成配置；启动时校验并给可执行的修复建议 | 新用户要读 README 才知道放 `.env`；配置写坏只有 deny |
-| Windows 实测；Linux/macOS 未测 | CI 三平台跑 `typecheck` + `test` | 无 `.github/workflows` |
-| 单进程假设 SQLite | 多实例并发时锁冲突可预期、可恢复 | 无 busy_timeout / 重试 |
+| **已修（M4.3）**：`SIGINT` 直接退进程 | Ctrl+C 停当前轮，再按一次退出 | `AbortSignal` 贯穿 REPL → HiveAgent → LangGraph；中止不再报成失败 |
+| **已做（M4.3）**：错误只有一句 `调用失败` | 可见的重试 / 降级 / 明确错误分类 | `classifyError`：鉴权 / 限流 / 超时 / 网络 / 预算 / 策略 / 中止，各带下一步 |
+| **已做（M4.3）**：配置只有 `.env` + policy | `hive init` 生成配置；启动时校验并给可执行的修复建议 | `hive init` 三份模板，不覆盖已有文件 |
+| Windows 实测；Linux/macOS 未测 | CI 三平台跑 `typecheck` + `test` | 无 `.github/workflows`（M4.4） |
+| **已加固（M4.3）**：单进程假设 SQLite | 多实例并发时锁冲突可预期、可恢复 | `busy_timeout=5000`；写入失败仍会返回 false，不静默 |
 | npm 发布卡 OTP | `npm i -g hive-agents` 一条命令 | 只差 6 位 OTP |
 
 ### 1.2 可扩展 —— 加能力要不要改源码
@@ -96,13 +96,18 @@ taskId；总花费约 $0.0007。零 API 测试另加 9 项（并发 4 + 任务�
 
 仍待做（M4.2b）：
 
-### M4.3 可工作：中断、恢复、初始化
+### M4.3 可工作：中断、恢复、初始化（2026-10-19 完成）
 
 1. Ctrl+C 只中止当前轮（`AbortController` 传进 `HiveAgent.run`），再按一次退出。
-2. 错误分类：鉴权 / 限流 / 网络 / 预算 / 策略，各自给人话与下一步。
-3. `hive init`：生成 `.env.example`、`.hive/policy.json`、`hive.config.json`，并跑一次 `doctor`。
-4. SQLite `busy_timeout` + 写重试；多实例并发不崩。
+2. 错误分类：鉴权 / 限流 / 网络 / 预算 / 策略 / 中止，各自给人话与下一步。
+3. `hive init`：生成 `.env.example`、`.hive/policy.json`、`hive.config.example.json`，不覆盖已有文件。
+4. SQLite `busy_timeout=5000`；多实例并发写冲突不立刻崩。
 5. `HIVE_DEBUG=1` 的结构化调试日志（默认关，零成本）。
+
+真机验收（2026-10-19）：`hive init` 三份模板生成正确；错误 key 显示
+`[鉴权失败] 401 ...` 并给出检查 key 的提示；`HIVE_DEBUG=1` 输出
+`ledger open` / `model invoke` 两条调试行；205 个零 API 测试全绿。
+另外修掉真机暴露的 `glob` 网关误判（pattern 不是路径，不该做 realpath 检查）。
 
 ### M4.4 发布：CI、文档、npm
 
