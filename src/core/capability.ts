@@ -46,6 +46,8 @@ export const CAPABILITY_ORDER: CapabilityId[] = [
   'shell',
   'web',
   'skill',
+  // v4 M4.2：MCP 追加在**最后** —— 顺序即前缀顺序，追加只影响装了它的 agent
+  'mcp',
 ];
 
 export const CAPABILITIES: Record<CapabilityId, Capability> = {
@@ -100,7 +102,67 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
     tools: [],
     needs: [],
   },
+  // v4 M4.2：MCP 工具在启动时动态注册（registerMcpTools）。没配 server = 0 工具 = 0 token。
+  mcp: {
+    id: 'mcp',
+    title: 'MCP',
+    summary: '外部 MCP server 提供的工具（启动时冻结清单；server 白名单见 /policy）',
+    tools: [],
+    needs: ['mcp'],
+  },
 };
+
+/** MCP 工具名的命名空间：`mcp__<server>__<tool>` */
+export const MCP_TOOL_PREFIX = 'mcp__';
+
+export function isMcpTool(name: string): boolean {
+  return name.startsWith(MCP_TOOL_PREFIX);
+}
+
+/** 从工具名里取 server 名（网关判定的 target） */
+export function mcpServerOf(name: string): string | undefined {
+  if (!isMcpTool(name)) return undefined;
+  const rest = name.slice(MCP_TOOL_PREFIX.length);
+  const at = rest.indexOf('__');
+  return at > 0 ? rest.slice(0, at) : undefined;
+}
+
+/** 生成 MCP 工具名：非法标识符字符换成下划线 */
+export function mcpToolName(server: string, tool: string): string {
+  return `${MCP_TOOL_PREFIX}${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, '_');
+}
+
+/** 启动时把连上的 MCP 工具装进 capability 注册表 */
+export function registerMcpTools(tools: AnyTool[]): void {
+  // TOOL_MAP / ALL_TOOLS 是模块加载时按 CAPABILITIES 算出来的常量对象/数组。
+  // 动态注册后必须同步：执行层按 TOOL_MAP 分派，不同步就会说「没有这个工具」。
+  const old = CAPABILITIES.mcp.tools.map((t) => t.name);
+  CAPABILITIES.mcp.tools = tools;
+  for (const name of old) {
+    delete TOOL_MAP[name];
+    const i = ALL_TOOLS.findIndex((t) => t.name === name);
+    if (i >= 0) ALL_TOOLS.splice(i, 1);
+  }
+  for (const t of tools) {
+    TOOL_MAP[t.name] = t;
+    if (!ALL_TOOLS.some((x) => x.name === t.name)) ALL_TOOLS.push(t);
+  }
+}
+
+/**
+ * 给指定身份打开 MCP 能力。
+ * 只加 capability，不碰别的 —— 工具集由 toolsFor 在 HiveAgent 构造时装配。
+ */
+export function enableMcpFor(agents: string[]): string[] {
+  const enabled: string[] = [];
+  for (const raw of agents) {
+    const id = raw.trim().toUpperCase() as AgentId;
+    if (!(id in AGENTS)) continue;
+    if (!AGENTS[id].capabilities.includes('mcp')) AGENTS[id].capabilities.push('mcp');
+    enabled.push(id);
+  }
+  return enabled;
+}
 
 /** 工具 → 动作类型。**没有映射 = 无副作用**（如 calculator），不进网关 */
 const TOOL_ACTION: Record<string, ActionKind> = {
@@ -114,10 +176,13 @@ const TOOL_ACTION: Record<string, ActionKind> = {
 };
 
 export function kindOf(tool: string): ActionKind | undefined {
+  // v4 M4.2：MCP 工具是动态注册的，不能靠静态表 —— 按命名空间认
+  if (isMcpTool(tool)) return 'mcp';
   return TOOL_ACTION[tool];
 }
 
 export function capabilityOfTool(tool: string): CapabilityId | undefined {
+  if (isMcpTool(tool)) return 'mcp';
   for (const id of CAPABILITY_ORDER) {
     if (CAPABILITIES[id].tools.some((t) => t.name === tool)) return id;
   }
@@ -169,7 +234,9 @@ export function toolsCharsFor(agent: AgentId): number {
   return toolsChars(toolsFor(agent));
 }
 
-/** 声明了但一个工具都没有的 capability（M2 的 shell/web/skill） */
+/** 声明了但一个工具都没有的 capability（web / skill）；MCP 是「还没配 server」，不算 */
 export function declaredOnly(): CapabilityId[] {
-  return CAPABILITY_ORDER.filter((id) => CAPABILITIES[id].tools.length === 0);
+  return CAPABILITY_ORDER.filter(
+    (id) => id !== 'mcp' && CAPABILITIES[id].tools.length === 0,
+  );
 }

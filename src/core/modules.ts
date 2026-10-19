@@ -24,7 +24,7 @@ export type AgentId = 'A' | 'B' | 'C' | 'D';
  * `shell` / `web` / `skill` M2 只声明、不实现（贡献 0 个工具）。
  * `calc` 是 v3 补的第 7 个 —— 原来挂在模块表里的算数工具也得有个归属。
  */
-export type CapabilityId = 'fs' | 'search' | 'calc' | 'shell' | 'web' | 'skill' | 'delegate';
+export type CapabilityId = 'fs' | 'search' | 'calc' | 'shell' | 'web' | 'skill' | 'delegate' | 'mcp';
 
 export interface AgentModule {
   /** 唯一 id，命令里用 /use <id> 切 */

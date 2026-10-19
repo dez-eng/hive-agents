@@ -34,7 +34,7 @@ import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 import { ChatDeepSeek } from '@langchain/deepseek';
 
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
-import { compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
+import { baseUrl, compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
 import type { Token } from './grant.js';
 import { makeTaskId, parseHandoffInput, type HandoffInput, type HandoffResult } from './handoff.js';
 import type { Ledger } from './ledger.js';
@@ -43,7 +43,7 @@ import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId
 import { STABLE_PREFIX, TAIL_MARK, renderUserContent } from './prompt.js';
 import { continueSubagent, runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
-import { TOOL_MAP, capabilityOfTool, kindOf, toolsFor } from './capability.js';
+import { TOOL_MAP, capabilityOfTool, kindOf, mcpServerOf, toolsFor } from './capability.js';
 import { checkAction, type Action } from './policy.js';
 
 export const StateAnnotation = Annotation.Root({
@@ -156,10 +156,13 @@ type BoundModel = ReturnType<NonNullable<BaseChatModel['bindTools']>>;
 function buildModel(modelId: string, think: ThinkBudget): ChatDeepSeek {
   const cap = maxOut();
   const kwargs = THINK_KWARGS[think];
+  const base = baseUrl();
   return new ChatDeepSeek({
     model: modelId,
     temperature: 0,
     maxRetries: 2,
+    // v4 M4.2：可选自定义端点；不设就走官方（与旧行为逐字节一致）
+    ...(base ? { configuration: { baseURL: base } } : {}),
     ...(cap ? { maxTokens: cap } : {}),
     ...(Object.keys(kwargs).length ? { modelKwargs: kwargs } : {}),
   });
@@ -493,7 +496,8 @@ function actionTarget(name: string, args: Record<string, unknown>): string {
     case 'delegate':
       return pick('to');
     default:
-      return '';
+      // v4 M4.2：MCP 工具名是 mcp__<server>__<tool>，网关的 target 是 server
+      return mcpServerOf(name) ?? '';
   }
 }
 

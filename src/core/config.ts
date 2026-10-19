@@ -16,6 +16,14 @@ export function modelName(): string {
   return (process.env.DEEPSEEK_MODEL ?? '').trim() || 'deepseek-flash';
 }
 
+/**
+ * v4 M4.2：DeepSeek 兼容端点。
+ * 不设 = 走官方；自建代理 / 本地兼容服务才需要（如 http://127.0.0.1:11434/v1）。
+ */
+export function baseUrl(): string {
+  return (process.env.DEEPSEEK_BASE_URL ?? '').trim();
+}
+
 /** 0 = 不封顶。实测封顶只会把答案切断，省不了钱 */
 export function maxOut(): number {
   const n = Number.parseInt(process.env.HIVE_MAX_OUT ?? '0', 10);

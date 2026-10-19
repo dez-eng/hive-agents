@@ -13,6 +13,10 @@ import { silenceSqliteWarning } from './core/warn.js';
 silenceSqliteWarning();
 
 import { APP_NAME, VERSION, hasApiKey, loadDotEnv, modelName, toolSteps, turnBudget } from './core/config.js';
+import { parsePriceOverlay, setPriceOverlay } from './core/cost.js';
+import { activateMcp, connectMcp, setMcpSummary, type McpConnection } from './core/mcp.js';
+import { setMcpAllowServers } from './core/policy.js';
+import { loadSettings } from './core/settings.js';
 import { DEFAULT_AGENT, DEFAULT_MODULE, getAgent, getModule } from './core/modules.js';
 import { parse, resolveAs } from './core/args.js';
 import { soloThread } from './core/handoff.js';
@@ -36,6 +40,23 @@ const USAGE = `${APP_NAME} ${VERSION} —— 缓存友好型 agent CLI
 
 async function main(): Promise<number> {
   loadDotEnv();
+  // v4 M4.2：配置文件（MCP / 价格）。写坏整份忽略，但要说清为什么
+  const settings = loadSettings();
+  for (const w of settings.warnings) process.stderr.write(`${w}\n`);
+
+  // 价格：文件 < 环境变量（环境变量显式覆盖文件）
+  if (settings.spec.price && Object.keys(settings.spec.price).length) {
+    setPriceOverlay(settings.spec.price);
+  }
+  const price = parsePriceOverlay(process.env.HIVE_PRICE_JSON);
+  if (price.ok) {
+    if (Object.keys(price.value).length) {
+      setPriceOverlay({ ...(settings.spec.price ?? {}), ...price.value });
+    }
+  } else {
+    process.stderr.write(`[HIVE_PRICE_JSON 写坏了，退回内置价：${price.reason}]\n`);
+  }
+
   const { mode, rest, as, cont } = parse(process.argv.slice(2));
 
   const ra = resolveAs(as);
@@ -55,10 +76,31 @@ async function main(): Promise<number> {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
+
+  // v4 M4.2：MCP 在 help/version 之后连 —— 那两条命令不该被 server 拖慢。
+  // 必须在 buildContext（new HiveAgent）之前：工具集在构造时按身份冻结。
+  let mcp: McpConnection | null = null;
+  const mcpCfg = settings.spec.mcp;
+  if (mcpCfg && Object.keys(mcpCfg.servers).length) {
+    mcp = await connectMcp(mcpCfg.servers);
+    const enabled = activateMcp(mcp, mcpCfg.agents);
+    if (mcpCfg.allowServers.length && !(process.env.HIVE_POLICY_MCP ?? '').trim()) {
+      setMcpAllowServers(mcpCfg.allowServers);
+    }
+    setMcpSummary({
+      path: settings.path,
+      source: settings.source,
+      servers: mcp.servers,
+      tools: mcp.tools.length,
+      agents: enabled,
+    });
+  }
+
   if (mode === 'doctor') {
     const { ctx } = buildContext(ra.as ? { as: ra.as } : {});
     const cmd = findCommand('/doctor')!;
     await cmd.run(ctx, []);
+    await mcp?.close();
     return 0;
   }
   if (mode === 'run') {
@@ -117,9 +159,11 @@ async function main(): Promise<number> {
         agent: ra.as ?? DEFAULT_AGENT,
       });
       printFooter(ctx);
+      await mcp?.close();
       return 0;
     } catch (e) {
       process.stderr.write(`调用失败：${e instanceof Error ? e.message : String(e)}\n`);
+      await mcp?.close();
       return 1;
     }
   }
@@ -133,6 +177,7 @@ async function main(): Promise<number> {
   // 独立会话挂在固定 thread 上，天然可续；--continue 只是把它说清楚
   void cont;
   await startRepl(ra.as ? { as: ra.as, thread: thread! } : {});
+  await mcp?.close();
   return 0;
 }
 

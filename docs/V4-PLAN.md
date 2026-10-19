@@ -32,8 +32,8 @@
 |---|---|---|
 | capability 硬编码在 `capability.ts` 的注册表 | 第三方 capability 可注册，不改核心 | 无插件边界、无版本、无生命周期 |
 | `web` / `skill` 只声明未实现 | `fetch`（域名白名单）与 playbook 装载 | 0 个工具 |
-| 无 MCP | 能接任意 MCP server，工具按 server 动态装配 | 无 client、无工具命名空间 |
-| provider 写死 `ChatDeepSeek`（`agent.ts:155`） | 一个 OpenAI-compatible 适配层覆盖 DeepSeek/OpenAI/Ollama | `buildModel` 与 `PRICE` 都绑死 DeepSeek |
+| **已接 MCP（M4.2a）** | 能接任意 MCP server，工具按 server 动态装配 | 见 `src/core/mcp.ts`；启动时冻结清单，`mcp.allowServers` 收权 |
+| **provider 已配置化（M4.2a）** | 模型 / 端点 / 价格可配 | `DEEPSEEK_BASE_URL` / `HIVE_PRICE_JSON`；按拍板不做多 provider 适配层 |
 | agent / 模块定义写死在 `modules.ts` | 从配置读 agent 定义（能力、主模块、mayCall） | 加一个身份要改源码 |
 | 无 skill | 装载 playbook（把一段方法论文本临时挂到尾部） | 与"前缀不变"约束的交互未设计 |
 
@@ -82,17 +82,19 @@ taskId；总花费约 $0.0007。零 API 测试另加 9 项（并发 4 + 任务�
 零 API 测试：并发两个假 runner → 各自 meter 不串、账本两行、预算各扣各的；
 并行中一个失败不影响另一个；`/tasks` 汇总正确。
 
-### M4.2 扩展：provider 抽象 + MCP + skill
+### M4.2 扩展：MCP + skill / web（M4.2a 完成 2026-10-19）
 
-1. **provider 适配层**：`ChatOpenAI`-compatible（DeepSeek/OpenAI/Ollama 一套），
-   `PRICE` 按 provider+model 查表；`hive doctor` 报当前 provider 与价格来源。
-2. **MCP client**：配置文件里列 server（stdio / http），启动时拉工具清单，
-   按 `mcp:<server>:<tool>` 命名装配成 capability；网关的 `kind` 映射到 `net`/`exec`。
-3. **skill**：`skill` capability 装载 playbook 文件；文本挂在**用户消息末尾**（不动前缀），
-   与角色片同一位置。
-4. **web**：`fetch`，域名白名单走 policy 的 `net`；默认 deny。
-5. **配置化 agent**：`hive.config.json` 可覆盖 `AGENTS`（capabilities / home / mayCall），
-   缺省仍用内置表。
+已完成（M4.2a）：
+
+1. **DeepSeek 配置化**：`DEEPSEEK_BASE_URL` 自定义端点；`HIVE_PRICE_JSON` 覆盖价表
+   （写坏退回内置价）；`hive doctor` 报价格来源。按拍板不做多 provider 适配层。
+2. **MCP client**：`hive.config.json` 的 `mcp.servers`（stdio）→ 启动时 `listTools()`
+   并冻结清单 → `mcp__<server>__<tool>` 动态装配 → policy 的 `mcp.allowServers` 白名单。
+   真机用 fixture echo server 验证：`echo` 与 `sum` 都调通。
+3. **身份级开关**：`mcp.agents` 指定哪些身份装 MCP；`.hive/policy.json` 的
+   `agents.X.mcp = "deny"` 可再收紧（身份 deny 优先于 server 白名单）。
+
+仍待做（M4.2b）：
 
 ### M4.3 可工作：中断、恢复、初始化
 
@@ -158,6 +160,6 @@ skill 都是一次全盘缓存作废。skill 文本按需装载，不进 checkpo
 1. 干净机器：`npm i -g hive-agents` → `hive init` → `hive doctor` → 真机一轮，全程不需要手写 `.env`
 2. CI 在 Windows/Linux/macOS 全绿（typecheck + 177+ 测试 + build）
 3. 并行借调：零 API 并发测试 + 一次真机（两个子任务同时跑，账本各自独立）
-4. 至少一个真实 MCP server 能接上并调用
+4. [x] 至少一个真实 MCP server 能接上并调用（M4.2a：fixture echo / sum）
 5. Ctrl+C 能停当前轮且会话不丢
 6. `0.x` 发布到 npm，GitHub Release 附 tgz

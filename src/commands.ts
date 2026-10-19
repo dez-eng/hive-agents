@@ -4,8 +4,8 @@
  * 分工：底部状态行默认只给一行（够用），细节全部藏在命令里。
  * 「某个聊天段花了多少 token」= /turn N 或 /turn N-M 或 /find 词。
  */
-import { BLOCK, VERSION, APP_NAME, currentBand, hasApiKey, memoryPath, toolSteps, turnBudget } from './core/config.js';
-import { priceFor } from './core/cost.js';
+import { BLOCK, VERSION, APP_NAME, baseUrl, currentBand, hasApiKey, memoryPath, toolSteps, turnBudget } from './core/config.js';
+import { priceFor, priceSource } from './core/cost.js';
 import type { HiveAgent } from './core/agent.js';
 import { Ledger, head, missOf, type LedgerRow } from './core/ledger.js';
 import { SessionTally, type TokenMeter } from './core/meter.js';
@@ -25,6 +25,7 @@ import { issueToken, remaining } from './core/grant.js';
 import { makeTaskId, type HandoffInput } from './core/handoff.js';
 import { continueSubagent, runSubagent } from './core/subagent.js';
 import { TASKS } from './core/tasks.js';
+import { mcpSummary } from './core/mcp.js';
 import {
   declaredOnly,
   toolNamesFor,
@@ -908,6 +909,28 @@ export const COMMANDS: Command[] = [
   },
 
   {
+    name: '/mcp',
+    usage: '/mcp',
+    summary: 'MCP server 与工具（启动时冻结；改配置后重启生效）',
+    async run(ctx) {
+      const m = mcpSummary();
+      if (!m) {
+        ctx.out(dim('[没配置 MCP —— 在 hive.config.json 里写 mcp.servers]'));
+        ctx.out(dim('  清单在启动时冻结：运行中改配置不会热插拔，重启才生效\n'));
+        return;
+      }
+      ctx.out(bold(`[MCP · ${m.path} · 身份 ${m.agents.join('/')} · ${m.tools} 个工具]`));
+      for (const s of m.servers) {
+        ctx.out(
+          `  ${s.name}  ${s.error ? red(`连接失败：${s.error}`) : green(`${s.tools} 个工具`)}`,
+        );
+      }
+      ctx.out(dim('  工具名 mcp__<server>__<tool> · 调用需 policy 的 mcp.allowServers 放行'));
+      ctx.out(dim('  改配置后重启 hive 生效（清单启动时冻结，避免前缀缓存悄悄作废）\n'));
+    },
+  },
+
+  {
     name: '/budget',
     usage: '/budget',
     summary: '本会话的令牌与预算余额',
@@ -1120,7 +1143,8 @@ export const COMMANDS: Command[] = [
     async run(ctx) {
       ctx.out(bold(`[${APP_NAME} ${VERSION} 自检]`));
       ctx.out(`  node          ${process.version} · ${process.platform}/${process.arch}`);
-      ctx.out(`  模型          ${ctx.agent.modelId}（${bandCn()}时价）`);
+      ctx.out(`  模型          ${ctx.agent.modelId}（${bandCn()}时价 · 价格来源 ${priceSource(ctx.agent.modelId)}）`);
+      ctx.out(`  端点          ${baseUrl() || 'DeepSeek 官方（默认）'}`);
       ctx.out(`  API key       ${hasApiKey() ? green('已设置') : red('未设置（.env 里填 DEEPSEEK_API_KEY）')}`);
       ctx.out(`  账本          ${ctx.ledger.open_ ? green('已打开') : red('打不开')} · ${ctx.ledger.path}`);
       ctx.out(`  checkpoint    ${ctx.agent.memoryFile}`);
@@ -1134,6 +1158,15 @@ export const COMMANDS: Command[] = [
           (pol.envKeys.length ? ` · env ${pol.envKeys.join(',')}` : ''),
       );
       ctx.out(`  工具（身份 ${me}） ${toolsFor(me).map((x) => x.name).join(', ')}（schema 合计 ${toolsCharsFor(me)} 字符）`);
+      const ms = mcpSummary();
+      if (ms) {
+        const ok = ms.servers.filter((s) => !s.error).length;
+        ctx.out(
+          `  MCP           ${ms.path} · ${ok}/${ms.servers.length} server · ${ms.tools} 工具 · 身份 ${ms.agents.join('/')}`,
+        );
+      } else {
+        ctx.out(dim('  MCP           未配置（hive.config.json 的 mcp.servers）'));
+      }
       ctx.out(`  命令          ${COMMANDS.length} 个`);
       const m = ctx.state.lastTurn;
       if (m?.lastRaw) {

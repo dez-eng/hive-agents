@@ -39,8 +39,62 @@ export function bandNow(at: Date = new Date()): Band {
   return (h >= 1 && h < 4) || (h >= 6 && h < 10) ? 'peak' : 'off';
 }
 
+/**
+ * v4 M4.2：价格覆盖（来自 `HIVE_PRICE_JSON`）。
+ *
+ * 只覆盖JSON 里给出的模型，其余仍走内置表。放在模块级而不是每轮解析：
+ * 计价发生在每一次计量回调里，不能每轮 JSON.parse。
+ */
+let overlay: Record<string, ModelPrice> | null = null;
+
+function isBandPrice(v: unknown): v is BandPrice {
+  if (!v || typeof v !== 'object') return false;
+  const b = v as BandPrice;
+  return typeof b.peak === 'number' && typeof b.off === 'number' && b.peak >= 0 && b.off >= 0;
+}
+
+/**
+ * 纯函数：解析并校验价格覆盖。写坏时返回人话原因，调用方决定提示方式。
+ * 宁可退回内置价，也不能因为一个手滑的 JSON 把账算成 0。
+ */
+export function parsePriceOverlay(
+  raw: string | undefined,
+): { ok: true; value: Record<string, ModelPrice> } | { ok: false; reason: string } {
+  const text = (raw ?? '').trim();
+  if (!text) return { ok: true, value: {} };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, reason: `不是合法 JSON：${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: '顶层必须是对象：{ "模型名": { in_hit, in_miss, out } }' };
+  }
+  const out: Record<string, ModelPrice> = {};
+  for (const [model, v] of Object.entries(parsed)) {
+    const m = v as Record<string, unknown>;
+    if (!isBandPrice(m['in_hit']) || !isBandPrice(m['in_miss']) || !isBandPrice(m['out'])) {
+      return { ok: false, reason: `${model} 需要 in_hit / in_miss / out 三项，每项含非负的 peak 与 off` };
+    }
+    out[model] = { in_hit: m['in_hit'], in_miss: m['in_miss'], out: m['out'] };
+  }
+  return { ok: true, value: out };
+}
+
+/** 设置覆盖（传 null 清空 —— 测试与配置重载用） */
+export function setPriceOverlay(v: Record<string, ModelPrice> | null): void {
+  overlay = v;
+}
+
+/** 这个模型的价格来自哪：env 覆盖 / 内置表 / 回落到默认模型 */
+export function priceSource(model: string): 'env' | 'builtin' | 'fallback' {
+  if (overlay?.[model]) return 'env';
+  return PRICE[model] ? 'builtin' : 'fallback';
+}
+
 export function priceFor(model: string): ModelPrice {
-  return PRICE[model] ?? PRICE[FALLBACK_MODEL]!;
+  return overlay?.[model] ?? PRICE[model] ?? PRICE[FALLBACK_MODEL]!;
 }
 
 export interface InputUsage {

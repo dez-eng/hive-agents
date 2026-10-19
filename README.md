@@ -67,9 +67,10 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `calc` | `calculator` | 无副作用，不进网关 |
 | `shell` | `bash` | **默认全拒**，见「沙箱」一节 |
 | `delegate` | `delegate` | 借调 / 续跑同一子会话 / `parallel` 并发交办（令牌 + 预算闸门） |
+| `mcp` | `mcp__<server>__<tool>` | 外部 MCP server（启动时冻结清单；`mcp.allowServers` 白名单） |
 | `web` `skill` | — | 只声明，还没实现（贡献 0 token） |
 
-各身份每轮为工具 schema 付的钱（`/caps` 随时可查）：
+各身份每轮为工具 schema 付的钱（`/caps` 随时可查；下表不含 MCP —— MCP 工具按配置动态增加）：
 
 | 身份 | 工具数 | 字符/轮 |
 |---|---|---|
@@ -131,6 +132,29 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 
 ---
 
+## MCP：接外部工具
+
+在 `hive.config.json`（可用 `HIVE_CONFIG` 换路径）里声明 stdio server：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "echo": { "command": "node", "args": ["--import", "tsx", "server.ts"], "cwd": "." }
+    },
+    "agents": ["A"],
+    "allowServers": ["echo"]
+  }
+}
+```
+
+- 启动时一次性 `listTools()` 并**冻结清单**：运行中不热插拔 —— 工具 schema 变了、
+  前缀缓存却不知道，那是最贵的一种错。改配置 → 重启。
+- 工具名 `mcp__<server>__<tool>`；`/mcp` 看连接状态与工具数。
+- **装了 ≠ 准调**：`mcp.allowServers` 为空时全部拒绝；`.hive/policy.json` 里
+  `agents.X.mcp = "deny"` 可以再收紧（身份 deny 优先于 server 白名单）。
+- 连不上的 server 只报一条警告，不影响 hive 启动。
+
 ## 多 agent：A 主 + B/C/D 副，每个都能单独启动
 
 | 身份 | 角色 | 主模块 | 可借调 | 单独启动 |
@@ -159,7 +183,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 
 ---
 
-## 命令（27 个）
+## 命令（28 个）
 
 | 命令 | 作用 |
 |---|---|
@@ -173,6 +197,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `/as A\|B\|C\|D` | 切身份（调试用） |
 | `/delegate <身份> <目标>` ／ `/delegate --continue <taskId> <追加>` | 交办一次 / 续跑同一子会话（taskId 见 `/handoffs`）；模型调工具时还支持 `parallel` 并发 |
 | `/tasks [n]` | 本次进程的子任务：运行中/完成/熔断/拒绝、预算与耗时（历史看 `/handoffs`） |
+| `/mcp` | MCP server 与工具清单（启动时冻结；改配置后重启生效） |
 | `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录（记录里带子会话 thread） |
 | `/tail on\|off` `/status on\|off` | 尾部角色片开关 / 底部状态行开关 |
 | `/new` `/history` | 开新会话（冷缓存） / 存档点 |
@@ -202,6 +227,10 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `HIVE_MAX_OUT` | `0` | 输出封顶（**实测封顶只会切断答案，省不了钱**） |
 | `HIVE_LEDGER` | `costs.db` | 账本路径（默认在工作目录） |
 | `HIVE_MEMORY` | `.hive/memory.db` | langgraph checkpoint |
+| `HIVE_CONFIG` | `hive.config.json` | MCP / 价格配置文件 |
+| `DEEPSEEK_BASE_URL` | — | 自定义 DeepSeek 兼容端点（不设走官方） |
+| `HIVE_PRICE_JSON` | — | 覆盖内置价表（JSON；写坏退回内置价） |
+| `HIVE_POLICY_MCP` | — | MCP server 白名单（逗号分隔；优先于配置文件） |
 
 ## 账本
 
@@ -240,8 +269,10 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v3 M2.6 沙箱加固：子进程 env 最小化、路径解析真实路径
 - [x] v3 M3.1 子会话可续（父驱动往返）+ 按 agent 核账（`/ledger agents`）
 - [x] v4 M4.1 协调：并行借调（`parallel`）+ 每 run 独立 runtime + `/tasks`
+- [x] v4 M4.2a 扩展：MCP（stdio + 动态工具 + policy）+ DeepSeek 配置化
+- [ ] v4 M4.2b 扩展：`skill` / `web`
 - [ ] v3 M3.5 剩余：B 主动反问 A、`@` 寻址
-- [ ] v4 M4.2 扩展：MCP / skill / `web`；M4.3 可工作（中断、init、CI）；M4.4 发布
+- [ ] v4 M4.3 可工作（中断、init、CI）；M4.4 发布
 - [ ] 以后：容器级隔离
 
 设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。

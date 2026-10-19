@@ -19,7 +19,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'no
 
 import { AGENTS, mayDelegate, type AgentId, type CapabilityId } from './modules.js';
 
-export type ActionKind = 'fs.read' | 'fs.write' | 'exec' | 'net' | 'delegate';
+export type ActionKind = 'fs.read' | 'fs.write' | 'exec' | 'net' | 'delegate' | 'mcp';
 export type Decision = 'allow' | 'deny' | 'ask';
 
 export interface PolicySpec {
@@ -31,6 +31,11 @@ export interface PolicySpec {
   agents: Partial<Record<AgentId, Partial<Record<ActionKind, Decision>>>>;
   exec: { allowCommands: string[] };
   net: { allowDomains: string[] };
+  /**
+   * v4 M4.2：MCP server 白名单。
+   * 空数组 = 一个都不许；`"*"` = 不限（自担风险）。身份级规则仍可显式 deny。
+   */
+  mcp: { allowServers: string[] };
   /** search 遍历时跳过的目录名 */
   ignore: string[];
 }
@@ -57,7 +62,7 @@ export interface Verdict {
   rule: string;
 }
 
-const KINDS: ActionKind[] = ['fs.read', 'fs.write', 'exec', 'net', 'delegate'];
+const KINDS: ActionKind[] = ['fs.read', 'fs.write', 'exec', 'net', 'delegate', 'mcp'];
 
 /** 内置默认 —— 与 docs/V3-M2-DESIGN.md §3.4 一致（default deny，A/C 可写、B/D 只读） */
 export const DEFAULT_SPEC: PolicySpec = {
@@ -71,6 +76,7 @@ export const DEFAULT_SPEC: PolicySpec = {
   },
   exec: { allowCommands: [] },
   net: { allowDomains: [] },
+  mcp: { allowServers: [] },
   ignore: ['.git', 'node_modules', 'dist', '.hive'],
 };
 
@@ -81,6 +87,7 @@ function cloneSpec(s: PolicySpec): PolicySpec {
     agents: JSON.parse(JSON.stringify(s.agents)) as PolicySpec['agents'],
     exec: { allowCommands: [...s.exec.allowCommands] },
     net: { allowDomains: [...s.net.allowDomains] },
+    mcp: { allowServers: [...s.mcp.allowServers] },
     ignore: [...s.ignore],
   };
 }
@@ -133,6 +140,11 @@ export function normalize(raw: unknown): PolicySpec {
     const list = strList((net as Record<string, unknown>)['allowDomains']);
     if (list) spec.net.allowDomains = list;
   }
+  const mcp = o['mcp'];
+  if (mcp && typeof mcp === 'object') {
+    const list = strList((mcp as Record<string, unknown>)['allowServers']);
+    if (list) spec.mcp.allowServers = list;
+  }
 
   return spec;
 }
@@ -146,6 +158,7 @@ export const ENV_KEYS = [
   'HIVE_POLICY_WRITE',
   'HIVE_POLICY_EXEC',
   'HIVE_POLICY_NET',
+  'HIVE_POLICY_MCP',
 ] as const;
 
 const ENV_KIND: Array<[string, ActionKind]> = [
@@ -186,6 +199,15 @@ export function applyEnv(spec: PolicySpec, env: NodeJS.ProcessEnv = process.env)
       const slot = (out.agents[id] ??= {});
       slot[kind] = allow.includes(id) ? 'allow' : 'deny';
     }
+  }
+
+  // v4 M4.2：MCP 是 server 白名单，不是按身份
+  const mcpRaw = (env['HIVE_POLICY_MCP'] ?? '').trim();
+  if (mcpRaw) {
+    out.mcp.allowServers = mcpRaw
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
   }
 
   return out;
@@ -240,6 +262,15 @@ export function loadPolicy(force = false, env: NodeJS.ProcessEnv = process.env):
 /** 测试 / 嵌入用：注入一份策略；传 null 清掉缓存回到从配置读 */
 export function setPolicySpec(spec: PolicySpec | null): void {
   cached = spec ? { spec: cloneSpec(spec), source: '注入', warnings: [], envKeys: [] } : null;
+}
+
+/**
+ * v4 M4.2：把 hive.config.json 里的 `mcp.allowServers` 并入当前策略。
+ * 调用方负责「env 优先」—— `HIVE_POLICY_MCP` 设了就不要走这里。
+ */
+export function setMcpAllowServers(servers: string[]): void {
+  const cur = loadPolicy();
+  cached = { ...cur, spec: { ...cur.spec, mcp: { allowServers: [...servers] } } };
 }
 
 export function currentSpec(): PolicySpec {
@@ -455,6 +486,33 @@ export function checkAction(a: Action, spec: PolicySpec = currentSpec()): Verdic
       return verdict(false, 'denied', `${a.by} 不能借调 ${to}`, `AGENTS.${a.by}.mayCall`);
     }
     return verdict(true, 'allow', `可借调 ${to}`, `AGENTS.${a.by}.mayCall`);
+  }
+
+  /**
+   * v4 M4.2：MCP 工具。target = server 名。
+   * 判定：身份显式 deny 优先 → 身份显式 allow → server 白名单 → 默认拒绝。
+   * `mcp.allowServers` 本身就是「显式允许」，不受 default deny 影响。
+   */
+  if (a.kind === 'mcp') {
+    const server = a.target.trim();
+    if (!server) return verdict(false, 'denied', 'MCP 工具缺少 server 名', 'mcp.allowServers');
+    const agentRule = specOfAgent['mcp'];
+    if (agentRule === 'deny') {
+      return verdict(false, 'denied', `规则 agents.${a.by}.mcp = deny`, `agents.${a.by}.mcp`);
+    }
+    if (agentRule === 'allow') {
+      return verdict(true, 'allow', `${a.by} 允许所有 MCP server`, `agents.${a.by}.mcp`);
+    }
+    const allowed = spec.mcp.allowServers;
+    if (allowed.includes('*') || allowed.includes(server)) {
+      return verdict(true, 'allow', `MCP server ${server} 在 allowServers 里`, 'mcp.allowServers');
+    }
+    return verdict(
+      false,
+      'denied',
+      `MCP server ${server} 不在 allowServers（${allowed.join(',') || '空'}）`,
+      'mcp.allowServers',
+    );
   }
 
   if (a.kind === 'fs.read' || a.kind === 'fs.write') {

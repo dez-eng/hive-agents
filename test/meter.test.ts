@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { TokenMeter, extractUsage } from '../src/core/meter.js';
+import { parsePriceOverlay, priceFor, priceSource, setPriceOverlay } from '../src/core/cost.js';
 
 test('usage_metadata 标准位能读出来', () => {
   const s = extractUsage({
@@ -97,4 +98,52 @@ test('工具轮累加多次调用', () => {
   assert.equal(m.calls, 2);
   assert.equal(m.inTok, 2200);
   assert.equal(m.missTok(), 300);
+});
+
+test('v4 M4.2 价格覆盖：合法 JSON 按模型覆盖，其余仍走内置', () => {
+  const p = parsePriceOverlay(
+    JSON.stringify({
+      'my-model': {
+        in_hit: { peak: 1, off: 0.5 },
+        in_miss: { peak: 10, off: 5 },
+        out: { peak: 20, off: 10 },
+      },
+    }),
+  );
+  assert.ok(p.ok);
+  setPriceOverlay(p.value);
+  try {
+    assert.equal(priceFor('my-model').out.off, 10);
+    assert.equal(priceFor('deepseek-flash').out.off, 0.6, '没覆盖的模型仍用内置价');
+    assert.equal(priceSource('my-model'), 'env');
+    assert.equal(priceSource('deepseek-flash'), 'builtin');
+    assert.equal(priceSource('unknown-model'), 'fallback');
+  } finally {
+    setPriceOverlay(null);
+  }
+});
+
+test('v4 M4.2 价格覆盖：写坏给原因，不抛、不把价格算成 0', () => {
+  const bad = parsePriceOverlay('{bad');
+  assert.equal(bad.ok, false);
+  assert.match((bad as { reason: string }).reason, /JSON/);
+
+  const notObj = parsePriceOverlay('[]');
+  assert.equal(notObj.ok, false);
+  assert.match((notObj as { reason: string }).reason, /顶层/);
+
+  const negative = parsePriceOverlay(
+    JSON.stringify({
+      m: {
+        in_hit: { peak: 1, off: -1 },
+        in_miss: { peak: 1, off: 1 },
+        out: { peak: 1, off: 1 },
+      },
+    }),
+  );
+  assert.equal(negative.ok, false);
+
+  // 覆盖没设上 → 仍按内置/回落计价，不会变成 0
+  assert.equal(parsePriceOverlay('').ok, true);
+  assert.equal(priceFor('m').out.off, 0.6);
 });
