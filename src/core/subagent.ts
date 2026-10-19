@@ -19,10 +19,11 @@
 import type { AgentId, AgentModule } from './modules.js';
 import type { HandoffInput, HandoffResult } from './handoff.js';
 import { subThread } from './handoff.js';
-import { authorizeDelegate, debitToken, issueToken, type Token } from './grant.js';
+import { authorizeDelegate, issueToken, type Token } from './grant.js';
 import { isBudgetExceeded, tokenSpent } from './budget.js';
 import type { Ledger } from './ledger.js';
 import type { TokenMeter } from './meter.js';
+import { TASKS } from './tasks.js';
 import type { DelegateContext, TurnRequest, TurnResult } from './agent.js';
 
 /** 跑一轮的最小接口 —— HiveAgent 天然满足它，测试里塞假 runner 也满足 */
@@ -122,7 +123,7 @@ interface ExecuteOptions {
   issueChildToken: boolean;
 }
 
-async function execute(o: ExecuteOptions): Promise<HandoffResult> {
+async function executeInner(o: ExecuteOptions): Promise<HandoffResult> {
   const now = (o.deps.now ?? Date.now)();
   const budget = o.budgetTokens;
 
@@ -136,6 +137,24 @@ async function execute(o: ExecuteOptions): Promise<HandoffResult> {
   });
   if (!verdict.ok) {
     return { taskId: o.taskId, ok: false, tokens: 0, costUsd: 0, budgetHit: false, notes: verdict.reason };
+  }
+
+  // v4 M4.1：并发预留 —— 授权检查与真正扣款之间不能留窗口，
+  // 否则两个并行子任务会同时看到同一份余额（超卖）。预留是原子条件更新。
+  // budget=0 表示不封顶（沿用 budget.ts 的语义），这时不预留，只按实际消耗记账。
+  let reserved = 0;
+  if (o.token && budget > 0) {
+    if (!o.deps.ledger.reserveToken(o.token.id, budget)) {
+      return {
+        taskId: o.taskId,
+        ok: false,
+        tokens: 0,
+        costUsd: 0,
+        budgetHit: false,
+        notes: `令牌 ${o.token.id} 预算不足（并发预留失败）`,
+      };
+    }
+    reserved = budget;
   }
 
   // §4：A 借调时自动签发 —— 让被借调者拿到令牌，并给它一层借调上下文，
@@ -188,13 +207,10 @@ async function execute(o: ExecuteOptions): Promise<HandoffResult> {
     }
   }
 
-  // 3. 扣令牌 + 落 handoffs（痕迹策略：checkpoint 弃、这张表留）
-  if (o.token && tokens > 0) {
-    // 从账本读当前 spent 再扣：同一个令牌对象会被多轮续跑复用，
-    // 拿内存里的旧值算会覆盖掉上一轮（首跑 120 + 续跑 120 变成 120）。
-    const current = o.deps.ledger.loadToken(o.token.id) ?? o.token;
-    const next = debitToken(current, tokens);
-    o.deps.ledger.updateTokenSpent(next.id, next.spent);
+  // 3. 结算令牌 + 落 handoffs（痕迹策略：checkpoint 弃、这张表留）
+  // v4 M4.1：预留 → 实际消耗（多退少补），原子增量；不再读旧值覆盖。
+  if (o.token) {
+    o.deps.ledger.settleToken(o.token.id, reserved, tokens);
   }
   o.deps.ledger.insertHandoff({
     taskId: o.taskId,
@@ -222,6 +238,30 @@ async function execute(o: ExecuteOptions): Promise<HandoffResult> {
     ...(notes ? { notes } : {}),
     thread: o.thread,
   };
+}
+
+/**
+ * v4 M4.1：执行核外再包一层任务登记。
+ *
+ * 登记放在 executeInner 之外，是为了覆盖它的**每一条**返回路径
+ * （授权拒、预留失败、正常完成、熔断）以及异常路径 —— /tasks 才不会漏任务。
+ */
+async function execute(o: ExecuteOptions): Promise<HandoffResult> {
+  TASKS.start({
+    taskId: o.taskId,
+    from: o.from,
+    to: o.as,
+    goal: o.goal,
+    budgetTokens: o.budgetTokens,
+  });
+  try {
+    const res = await executeInner(o);
+    TASKS.finish(o.taskId, res);
+    return res;
+  } catch (e) {
+    TASKS.fail(o.taskId, e instanceof Error ? e.message : String(e));
+    throw e;
+  }
 }
 
 export async function runSubagent(o: RunSubagentOptions): Promise<HandoffResult> {

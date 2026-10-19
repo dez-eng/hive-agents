@@ -66,7 +66,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `search` | `grep` `glob` | 正则搜内容 / 通配符列文件（不跟符号链接，带 200ms 正则软超时） |
 | `calc` | `calculator` | 无副作用，不进网关 |
 | `shell` | `bash` | **默认全拒**，见「沙箱」一节 |
-| `delegate` | `delegate` | 借调 / 在同一子会话里续跑（令牌 + 预算闸门） |
+| `delegate` | `delegate` | 借调 / 续跑同一子会话 / `parallel` 并发交办（令牌 + 预算闸门） |
 | `web` `skill` | — | 只声明，还没实现（贡献 0 token） |
 
 各身份每轮为工具 schema 付的钱（`/caps` 随时可查）：
@@ -159,7 +159,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 
 ---
 
-## 命令（26 个）
+## 命令（27 个）
 
 | 命令 | 作用 |
 |---|---|
@@ -171,7 +171,8 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `/modules` `/use <id>` | 列模块 / 切模块（压栈） |
 | `/stack` `/pop` | 看模块栈 / 弹一层 |
 | `/as A\|B\|C\|D` | 切身份（调试用） |
-| `/delegate <身份> <目标>` ／ `/delegate --continue <taskId> <追加>` | 交办一次 / 续跑同一子会话（taskId 见 `/handoffs`） |
+| `/delegate <身份> <目标>` ／ `/delegate --continue <taskId> <追加>` | 交办一次 / 续跑同一子会话（taskId 见 `/handoffs`）；模型调工具时还支持 `parallel` 并发 |
+| `/tasks [n]` | 本次进程的子任务：运行中/完成/熔断/拒绝、预算与耗时（历史看 `/handoffs`） |
 | `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录（记录里带子会话 thread） |
 | `/tail on\|off` `/status on\|off` | 尾部角色片开关 / 底部状态行开关 |
 | `/new` `/history` | 开新会话（冷缓存） / 存档点 |
@@ -238,8 +239,10 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v3 M2.5 实用化四件：`edit_file`、循环护栏、上下文压缩、`bash`
 - [x] v3 M2.6 沙箱加固：子进程 env 最小化、路径解析真实路径
 - [x] v3 M3.1 子会话可续（父驱动往返）+ 按 agent 核账（`/ledger agents`）
-- [ ] v3 M3.5 并行借调、B 主动反问 A、`@` 寻址
-- [ ] 以后：`web` / MCP / skill / 多 provider；容器级隔离
+- [x] v4 M4.1 协调：并行借调（`parallel`）+ 每 run 独立 runtime + `/tasks`
+- [ ] v3 M3.5 剩余：B 主动反问 A、`@` 寻址
+- [ ] v4 M4.2 扩展：MCP / skill / `web`；M4.3 可工作（中断、init、CI）；M4.4 发布
+- [ ] 以后：容器级隔离
 
 设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。
 

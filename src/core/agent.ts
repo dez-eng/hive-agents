@@ -22,6 +22,7 @@
  * 运行时（meter / 预算 / 借调上下文 / 当前档位）用闭包变量传进节点，
  * 借调嵌套时靠「保存-设置-恢复」保证各自读各自的计量。
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
@@ -35,7 +36,7 @@ import { ChatDeepSeek } from '@langchain/deepseek';
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
 import { compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
 import type { Token } from './grant.js';
-import { makeTaskId, parseHandoffInput, type HandoffResult } from './handoff.js';
+import { makeTaskId, parseHandoffInput, type HandoffInput, type HandoffResult } from './handoff.js';
 import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
 import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
@@ -170,12 +171,120 @@ function asObj(v: unknown): Record<string, unknown> {
 
 /** 借调结果的统一话术（首跑与续跑共用） */
 function formatDelegateResult(res: HandoffResult, to: AgentId, budget: number): string {
-  if (!res.ok) return `ERROR: 借调 ${to} 未通过 —— ${res.notes ?? '（无说明）'}`;
+  if (!res.ok) return `ERROR: 借调 ${to}（${res.taskId}）未通过 —— ${res.notes ?? '（无说明）'}`;
   if (res.budgetHit) {
     // 明确告诉上层「是预算不够、不是任务失败」，让它加大预算重试（真机实测过这个坑）
-    return `[${to}·熔断 ${res.tokens}/${budget} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
+    return `[${to}·${res.taskId}·熔断 ${res.tokens}/${budget} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
   }
-  return `[${to} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+  // v4 M4.1：结果里带 taskId —— 模型拿得到才谈得上「接着问」（不用再查 /handoffs）
+  return `[${to}·${res.taskId} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
+}
+
+/** 并行借调的硬上限 —— 防止模型一次派几十个把预算和连接打满 */
+const MAX_PARALLEL = 8;
+
+/**
+ * 并行借调里的单个目标过网关。
+ * 串行路径由 gateToolCall 统一判（它有单一 target）；并行没有单一 target，
+ * 只能在这里逐项判、逐项落账，一个被拒不影响同批其它任务。
+ */
+function gateDelegateTarget(to: string, runtime: GraphRuntime): string | null {
+  const action: Action = {
+    kind: 'delegate',
+    target: to,
+    by: runtime.agent,
+    capability: 'delegate',
+    tool: 'delegate',
+    threadId: runtime.threadId,
+    ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+  };
+  const v = checkAction(action);
+  runtime.ledger?.insertPolicy({
+    capability: 'delegate',
+    agent: runtime.agent,
+    target: to,
+    verdict: v.code,
+    reason: v.reason,
+    threadId: runtime.threadId,
+    ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+  });
+  if (v.allow) return null;
+  runtime.denied += 1;
+  return `被策略拒绝（${v.reason}）`;
+}
+
+/**
+ * v4 M4.1：并行借调。每个子任务仍是完整的 runSubagent（授权 + 预留预算 +
+ * 独立 thread + 落 handoffs），只是用 Promise.allSettled 同时跑 —— 一个失败
+ * 不影响其它。runtime 隔离由 AsyncLocalStorage 保证（见 buildGraph）。
+ */
+async function handleParallel(
+  raw: unknown,
+  runtime: GraphRuntime,
+): Promise<string> {
+  const ctx = runtime.delegate;
+  if (!ctx) return 'ERROR: 当前没有借调上下文（delegate 只能在会话里用）';
+  if (!Array.isArray(raw)) return 'ERROR: parallel 必须是数组';
+  if (raw.length < 2) return 'ERROR: parallel 至少 2 个；单个任务请用 to/goal';
+  if (raw.length > MAX_PARALLEL) return `ERROR: parallel 最多 ${MAX_PARALLEL} 个`;
+
+  const jobs: Array<{ input: HandoffInput; blocked?: string }> = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    const obj = asObj(raw[i]);
+    const parsed = parseHandoffInput({
+      taskId: makeTaskId(ctx.seq()),
+      from: ctx.from,
+      to: obj['to'],
+      goal: obj['goal'],
+      slice: obj['slice'],
+      expect: obj['expect'],
+      budgetTokens: obj['budgetTokens'],
+    });
+    if (!parsed.ok) return `ERROR: 并行任务 #${i + 1} 参数不合法 —— ${parsed.reason}`;
+    const blocked = gateDelegateTarget(parsed.value.to, runtime);
+    jobs.push({ input: parsed.value, ...(blocked ? { blocked } : {}) });
+  }
+
+  const settled = await Promise.allSettled(
+    jobs.map(async (job): Promise<HandoffResult> => {
+      if (job.blocked) {
+        return {
+          taskId: job.input.taskId,
+          ok: false,
+          tokens: 0,
+          costUsd: 0,
+          budgetHit: false,
+          notes: job.blocked,
+        };
+      }
+      return runSubagent({
+        as: job.input.to,
+        from: ctx.from,
+        input: job.input,
+        token: ctx.token,
+        thread: ctx.thread,
+        deps: {
+          runner: ctx.runner,
+          ledger: ctx.ledger,
+          module: ctx.moduleOf(job.input.to),
+          tail: ctx.tail,
+          makeChildDelegate: (childToken, childThread) =>
+            ctx.makeChild(childToken, childThread, job.input.to),
+        },
+      });
+    }),
+  );
+
+  const lines = settled.map((r, i) => {
+    const job = jobs[i]!;
+    if (r.status === 'rejected') {
+      const why = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      return `ERROR: 并行任务 #${i + 1}（${job.input.to}·${job.input.taskId}）执行异常 —— ${why}`;
+    }
+    return formatDelegateResult(r.value, job.input.to, job.input.budgetTokens);
+  });
+  const okCount = settled.filter((r) => r.status === 'fulfilled' && r.value.ok).length;
+  return [`[并行借调 ${jobs.length} 个 · 完成 ${okCount}]`, ...lines].join('\n');
 }
 
 /**
@@ -190,6 +299,11 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
   if (!ctx) return 'ERROR: 当前没有借调上下文（delegate 只能在会话里用）';
 
   const a = asObj(args);
+
+  // ── v4 M4.1：并行借调 ───────────────────────────────────
+  if (Array.isArray(a['parallel'])) {
+    return handleParallel(a['parallel'], runtime);
+  }
 
   // ── v3 M3：续跑 ───────────────────────────────────────────
   const resume = typeof a['resume'] === 'string' ? a['resume'].trim() : '';
@@ -401,6 +515,10 @@ function gateToolCall(
   const capability = capabilityOfTool(name);
   if (!kind || !capability) return null;
 
+  // v4 M4.1：并行借调没有单一 target，整批判定会误伤；
+  // 逐目标判定放在 handleParallel 里（gateDelegateTarget，同样落账）。
+  if (name === 'delegate' && Array.isArray(asObj(raw)['parallel'])) return null;
+
   const action: Action = {
     kind,
     target: actionTarget(name, asObj(raw)),
@@ -428,20 +546,21 @@ function gateToolCall(
 }
 
 function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: BaseCheckpointSaver) {
-  // 当前这一轮的运行时。一次只有一个活跃 run（REPL 串行），
-  // 借调嵌套时用「保存-设置-恢复」保证各自读各自的计量。
-  let runtime: GraphRuntime = {
-    meter: null,
-    budgetTokens: 0,
-    delegate: null,
-    think: 'low',
-    agent: DEFAULT_AGENT,
-    ledger: null,
-    threadId: '',
-    denied: 0,
-    steps: 0,
-    compacted: 0,
-    prevInTok: 0,
+  /**
+   * v4 M4.1：**每个 run 一份 runtime**，靠 AsyncLocalStorage 传进节点。
+   *
+   * 旧实现是整张图共享一个闭包变量，再靠「保存-设置-恢复」串行切换 ——
+   * REPL 串行时成立，并行借调（A 同时派 B 和 D）时两个 run 会互相覆盖
+   * 计量器、预算与拒绝计数，账必然串。ALS 跟着异步链走，父子 run 天然隔离。
+   */
+  const runtimeStore = new AsyncLocalStorage<GraphRuntime>();
+  const currentRuntime = (): GraphRuntime => {
+    const rt = runtimeStore.getStore();
+    if (!rt) {
+      // 走到这里说明有代码绕过 run() 直接调图节点 —— 宁可大声失败，也别静默串账
+      throw new Error('hive 内部错误：工具节点不在任何 run 的上下文里');
+    }
+    return rt;
   };
 
   // v3 M2：**每个 agent 一套工具**（V3-PLAN §3.1）—— 缓存单位从「全局一套」
@@ -460,6 +579,7 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
   }
 
   const callModel = async (state: typeof StateAnnotation.State) => {
+    const runtime = currentRuntime();
     // §6：闸门在模型调用之前。超了就不发请求，直接熔断这一轮
     if (runtime.meter && exceedsBudget(runtime.meter, runtime.budgetTokens)) {
       throw new BudgetExceeded(tokenSpent(runtime.meter), runtime.budgetTokens);
@@ -479,6 +599,7 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
   };
 
   const callTools = async (state: typeof StateAnnotation.State) => {
+    const runtime = currentRuntime();
     const last = state.messages[state.messages.length - 1];
     const agent = runtime.agent;
     // v3 M2：判据是**身份**的 capability 装配，不再是模块的白名单
@@ -538,7 +659,7 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
    */
   const afterTools = (): 'agent' | typeof END => {
     const max = toolSteps();
-    return max > 0 && runtime.steps >= max ? END : 'agent';
+    return max > 0 && currentRuntime().steps >= max ? END : 'agent';
   };
 
   const app = new StateGraph(StateAnnotation)
@@ -551,10 +672,8 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
 
   return {
     app,
-    setRuntime: (r: GraphRuntime): void => {
-      runtime = r;
-    },
-    getRuntime: (): GraphRuntime => runtime,
+    /** 在一个独立的 runtime 上下文里执行 —— 并发 run 之间互不串账 */
+    withRuntime: <T>(r: GraphRuntime, fn: () => Promise<T>): Promise<T> => runtimeStore.run(r, fn),
   };
 }
 
@@ -608,10 +727,9 @@ export class HiveAgent {
     const meter = new TokenMeter({ model: this.modelId });
     const sentContent = renderUserContent(req.text, req.module, { tail: req.tail });
 
-    const saved = this.graph.getRuntime();
-    // 持有本轮 runtime 的引用：finally 会把 graph 上的 runtime 恢复成上一轮，
-    // 靠 getRuntime() 事后读会读到旧值（denied 永远是 0）—— 所以直接读这个对象
-    const rt = {
+    // v4 M4.1：这一轮的 runtime 只属于这一轮。并发 run（并行借调）各自持有一份，
+    // 节点通过 AsyncLocalStorage 取到自己的那份 —— 不用再「保存-恢复」全局变量。
+    const rt: GraphRuntime = {
       meter,
       budgetTokens: req.budgetTokens ?? 0,
       delegate: req.delegate ?? null,
@@ -625,61 +743,61 @@ export class HiveAgent {
       compacted: 0,
       prevInTok: this.prevInTok.get(req.threadId) ?? 0,
     };
-    this.graph.setRuntime(rt);
 
-    // ⚠ LangGraph 自己的递归上限默认 25，比我们的步数护栏更早触发 ——
-    // 一批工具 = 「agent + tools」两次跳转，所以必须把上限抬到 2×步数 + 余量，
-    // 否则先抛的是 GraphRecursionError（那是报错，不是我们想要的「安静停下」）。
-    const steps = toolSteps();
-    const config = {
-      configurable: { thread_id: req.threadId },
-      callbacks: [meter],
-      streamMode: 'messages' as const,
-      recursionLimit: steps > 0 ? steps * 2 + 6 : 1000,
-    };
+    return this.graph.withRuntime(rt, async () => {
+      // ⚠ LangGraph 自己的递归上限默认 25，比我们的步数护栏更早触发 ——
+      // 一批工具 = 「agent + tools」两次跳转，所以必须把上限抬到 2×步数 + 余量，
+      // 否则先抛的是 GraphRecursionError（那是报错，不是我们想要的「安静停下」）。
+      const steps = toolSteps();
+      const config = {
+        configurable: { thread_id: req.threadId },
+        callbacks: [meter],
+        streamMode: 'messages' as const,
+        recursionLimit: steps > 0 ? steps * 2 + 6 : 1000,
+      };
 
-    let text = '';
-    try {
-      const stream = (await this.graph.app.stream(
-        { messages: [new HumanMessage(sentContent)], module: req.module.id },
-        config,
-      )) as AsyncIterable<[BaseMessage, Record<string, unknown>]>;
+      let text = '';
+      try {
+        const stream = (await this.graph.app.stream(
+          { messages: [new HumanMessage(sentContent)], module: req.module.id },
+          config,
+        )) as AsyncIterable<[BaseMessage, Record<string, unknown>]>;
 
-      for await (const [chunk, meta] of stream) {
-        if (meta?.['langgraph_node'] !== 'agent') continue;
-        const piece = contentToText(chunk.content);
-        if (!piece) continue;
-        text += piece;
-        onChunk?.(piece);
+        for await (const [chunk, meta] of stream) {
+          if (meta?.['langgraph_node'] !== 'agent') continue;
+          const piece = contentToText(chunk.content);
+          if (!piece) continue;
+          text += piece;
+          onChunk?.(piece);
+        }
+      } catch (e) {
+        if (isBudgetExceeded(e)) {
+          return {
+            text,
+            sentContent,
+            meter,
+            budgetHit: true,
+            denied: rt.denied,
+            steps: rt.steps,
+            compacted: rt.compacted,
+          };
+        }
+        throw e;
+      } finally {
+        // 这一轮的入 token 就是下一轮的尺子（按 thread 存，并发子任务各记各的）
+        this.prevInTok.set(req.threadId, meter.inTok);
       }
-    } catch (e) {
-      if (isBudgetExceeded(e)) {
-        return {
-          text,
-          sentContent,
-          meter,
-          budgetHit: true,
-          denied: rt.denied,
-          steps: rt.steps,
-          compacted: rt.compacted,
-        };
-      }
-      throw e;
-    } finally {
-      // 这一轮的入 token 就是下一轮的尺子（在恢复旧 runtime 之前先记下）
-      this.prevInTok.set(req.threadId, meter.inTok);
-      this.graph.setRuntime(saved);
-    }
 
-    return {
-      text,
-      sentContent,
-      meter,
-      budgetHit: false,
-      denied: rt.denied,
-      steps: rt.steps,
-      compacted: rt.compacted,
-    };
+      return {
+        text,
+        sentContent,
+        meter,
+        budgetHit: false,
+        denied: rt.denied,
+        steps: rt.steps,
+        compacted: rt.compacted,
+      };
+    });
   }
 
   async history(threadId: string): Promise<BaseMessage[]> {

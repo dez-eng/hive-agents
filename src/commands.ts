@@ -24,6 +24,7 @@ import { THINK_CANDIDATES, pickThinkingOff, runThinkProbe, thinkVerdict } from '
 import { issueToken, remaining } from './core/grant.js';
 import { makeTaskId, type HandoffInput } from './core/handoff.js';
 import { continueSubagent, runSubagent } from './core/subagent.js';
+import { TASKS } from './core/tasks.js';
 import {
   declaredOnly,
   toolNamesFor,
@@ -867,6 +868,40 @@ export const COMMANDS: Command[] = [
             `  ${fmtUsd(h.costUsd)}  ${h.taskId}`,
         );
         ctx.out(dim(`      目标「${h.goal}」${h.notes ? ` · ${h.notes}` : ''}`));
+      }
+      ctx.out();
+    },
+  },
+
+  {
+    name: '/tasks',
+    usage: '/tasks [n]',
+    summary: '本次进程发起的子任务：运行中/完成/熔断/拒绝、预算与耗时（历史看 /handoffs）',
+    async run(ctx, args) {
+      const n = Number(args[0]) || 20;
+      const rows = TASKS.list(n);
+      if (!rows.length) {
+        ctx.out(dim('[这次进程还没发起子任务 —— 子任务由 delegate / /delegate 产生]\n'));
+        return;
+      }
+      ctx.out(bold(`[本次进程的子任务 ${rows.length} 个 · 新的在前]`));
+      for (const t of rows) {
+        const state =
+          t.state === 'running'
+            ? yellow('运行中')
+            : t.state === 'done'
+              ? green('完成')
+              : t.state === 'budget'
+                ? red('熔断')
+                : t.state === 'denied'
+                  ? red('拒绝')
+                  : red('失败');
+        const ms = (t.endedAt ?? Date.now()) - t.startedAt;
+        ctx.out(
+          `  ${t.taskId}  ${t.from}→${t.to}  ${state}  ${fmtInt(t.tokens)}/${fmtInt(t.budgetTokens)} token` +
+            `  ${fmtUsd(t.costUsd)}  ${ms}ms`,
+        );
+        ctx.out(dim(`      ${t.goal}${t.notes ? ` · ${t.notes}` : ''}`));
       }
       ctx.out();
     },

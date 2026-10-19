@@ -194,10 +194,15 @@ export const delegateTool = tool(
   },
   {
     name: 'delegate',
-    description: '把子任务交给另一个 agent（需 A 签发的令牌，受预算闸门限制）。预算给足，太小会在子任务里被熔断。给 resume 则在同一子会话里续跑。',
+    description:
+      '把子任务交给另一个 agent（需 A 签发的令牌，受预算闸门限制）。预算给足，太小会在子任务里被熔断。' +
+      '给 resume 则在同一子会话里续跑；给 parallel 则并发交办多个子任务。',
     schema: z.object({
-      to: z.enum(['A', 'B', 'C', 'D']).describe('借调目标身份'),
-      goal: z.string().describe('一句话目标；续跑时是追问内容'),
+      to: z
+        .enum(['A', 'B', 'C', 'D'])
+        .optional()
+        .describe('借调目标身份（串行必填；并行用 parallel）'),
+      goal: z.string().optional().describe('一句话目标；续跑时是追问内容（串行必填）'),
       slice: z
         .string()
         .optional()
@@ -207,11 +212,26 @@ export const delegateTool = tool(
         .number()
         .int()
         .nonnegative()
+        .optional()
         .describe('这次交办/续跑的预算（token）。太小会被熔断；需要读文件/改文件的任务建议 ≥ 2000'),
       resume: z
         .string()
         .optional()
         .describe('续跑：上次返回的 taskId；给了就复用同一个子会话（thread 不变）'),
+      parallel: z
+        .array(
+          z.object({
+            to: z.enum(['A', 'B', 'C', 'D']).describe('目标身份'),
+            goal: z.string().describe('一句话目标'),
+            slice: z.string().optional().describe('结构化输入切片'),
+            expect: z.string().optional().describe('期望产物'),
+            budgetTokens: z.number().int().nonnegative().describe('该子任务的预算（token）'),
+          }),
+        )
+        .min(2)
+        .max(8)
+        .optional()
+        .describe('并行借调 2-8 个子任务（A 同时派 B 和 D）；与 to/goal 互斥'),
     }),
   },
 );

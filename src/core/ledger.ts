@@ -757,6 +757,47 @@ export class Ledger {
     }
   }
 
+  /**
+   * v4 M4.1：并发安全地**预留**一笔预算。
+   *
+   * 「检查余额 + 扣减」必须在同一条 SQL 里完成，否则两个并发子任务会同时
+   * 看到同一份余额（超卖）。条件更新是原子的：changes=0 就是没抢到。
+   * 账本打不开时不阻塞 —— 与其它写方法一致：落不了盘不等于不能用。
+   */
+  reserveToken(id: string, amount: number): boolean {
+    const need = Math.trunc(amount);
+    if (need <= 0) return true;
+    if (!this.db) return true;
+    try {
+      const r = this.db
+        .prepare('UPDATE tokens SET spent = spent + ? WHERE id=? AND spent + ? <= budget_tok')
+        .run(need, id, need);
+      if (Number(r.changes) > 0) return true;
+      // 条件更新没抢到：要么余额不够，要么这张令牌只在内存里（测试 / 未落库）。
+      // 后者交给 authorizeDelegate 与结算兜底 —— 不能把「没这行」误判成超预算。
+      const exists = this.db.prepare('SELECT 1 FROM tokens WHERE id=?').get(id);
+      return !exists;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 预留 → 结算：把预留额换成实际消耗（delta 可负，即退回多留的部分）。
+   * 用增量而不是覆盖，避免把并发期间别处记的账冲掉。
+   */
+  settleToken(id: string, reserved: number, actual: number): boolean {
+    const delta = Math.trunc(actual) - Math.trunc(reserved);
+    if (delta === 0) return true;
+    if (!this.db) return true;
+    try {
+      this.db.prepare('UPDATE tokens SET spent = spent + ? WHERE id=?').run(delta, id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ── v2：交接记录 ──────────────────────────────────────────
 
   insertHandoff(h: HandoffRecord): number | null {
