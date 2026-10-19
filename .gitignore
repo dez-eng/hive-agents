@@ -10,3 +10,6 @@ coverage/
 # 凭证
 .env
 .env.local
+
+# 用户实际配置（MCP server 可能带 token）
+hive.config.json

@@ -26,7 +26,9 @@
   "files": [
     "dist",
     "README.md",
-    ".env.example"
+    "CHANGELOG.md",
+    ".env.example",
+    "hive.config.example.json"
   ],
   "engines": {
     "node": ">=22.5.0"

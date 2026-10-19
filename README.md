@@ -1,5 +1,7 @@
 # hive
 
+[![CI](https://github.com/dez-eng/hive-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/dez-eng/hive-agents/actions/workflows/ci.yml)
+
 一个把「省 token」当第一性问题的 agent CLI：**一段逐字节不变的前缀 + 挂在消息末尾的角色模块 + 内置的 token 账本**。
 
 TypeScript / langgraph.js。`npm i -g hive-agents` 之后一条 `hive` 就能开。
@@ -259,6 +261,9 @@ npm run build       # 产物在 dist/
 npm run dev         # 直接跑 src/cli.ts
 ```
 
+提交前建议 `npm ci && npm run typecheck && npm test`。贡献约定与「加一个 capability」的步骤见
+[`CONTRIBUTING.md`](CONTRIBUTING.md)，版本变更见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 测试全部零 API（假模型 / 临时目录 / 纯函数），所以改代码不必花一分钱。
 
 ## 路线图
@@ -275,7 +280,8 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v4 M4.3 可工作：Ctrl+C 只停当前轮、错误分类、`hive init`、busy_timeout、`HIVE_DEBUG`
 - [ ] v4 M4.2b 扩展：`skill` / `web`
 - [ ] v3 M3.5 剩余：B 主动反问 A、`@` 寻址
-- [ ] v4 M4.4 发布：CI / CHANGELOG / npm
+- [x] v4 M4.4 发布工程：三平台 CI、CHANGELOG、CONTRIBUTING
+- [ ] npm 0.1.0 发布（只差 6 位 OTP）
 - [ ] 以后：容器级隔离
 
 设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。

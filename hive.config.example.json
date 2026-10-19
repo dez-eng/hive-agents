@@ -1,0 +1,8 @@
+{
+  "mcp": {
+    "servers": {},
+    "agents": ["A"],
+    "allowServers": []
+  },
+  "price": {}
+}
