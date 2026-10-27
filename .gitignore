@@ -6,6 +6,10 @@ coverage/
 *.db
 *.db-wal
 *.db-shm
+# MCP memory server 的数据（v3 M3.5 配置里落在 .hive/）
+.hive/mcp-memory.json
+# 本地策略（可能含个人白名单；模板由 hive init 生成）
+.hive/policy.json
 
 # 凭证
 .env
