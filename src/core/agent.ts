@@ -44,8 +44,10 @@ import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId
 import { STABLE_PREFIX, TAIL_MARK, renderUserContent } from './prompt.js';
 import { continueSubagent, runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
-import { TOOL_MAP, capabilityOfTool, kindOf, mcpServerOf, toolsFor } from './capability.js';
+import { TOOL_MAP, capabilityOfTool, isMcpTool, kindOf, mcpServerOf, toolsFor } from './capability.js';
 import { checkAction, type Action } from './policy.js';
+import { isSkillTool, loadSkillByName, withSkill, type LoadResult, type LoadedSkill } from './skill.js';
+import { clipQuestion, isAskTool } from './dialog.js';
 
 export const StateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -82,6 +84,17 @@ export interface DelegateContext {
   makeChild: (childToken: Token, childThread: string, as: AgentId) => DelegateContext;
 }
 
+/**
+ * v3 M3.5：子任务的父上下文。只够 ask_parent 用 ——
+ * 它不需要父的历史，只需要「问谁」与「用哪个 taskId 回来」。
+ */
+export interface ParentContext {
+  /** 发起这次借调的身份 */
+  from: AgentId;
+  /** 父手上的 taskId；父回答时用它 resume */
+  taskId: string;
+}
+
 export interface TurnRequest {
   text: string;
   threadId: string;
@@ -93,6 +106,11 @@ export interface TurnRequest {
   signal?: AbortSignal;
   /** v2：借调上下文。不传 = 这一轮里 delegate 不可用 */
   delegate?: DelegateContext;
+  /**
+   * v3 M3.5：这一轮是**子任务**时的父上下文 —— ask_parent 用它。
+   * 不传 = 没有父（主会话 / 独立会话），ask_parent 会被拒。
+   */
+  parent?: ParentContext;
   /**
    * v3 M2：这一轮以**谁**的身份跑 —— 决定工具集（toolsFor）、网关判据（by）
    * 与账本的 agent 栏。借调子任务传被借调的身份，独立会话传栈顶身份。
@@ -118,6 +136,8 @@ export interface TurnResult {
   steps: number;
   /** v3 M2.5：本轮发送前压掉了多少条旧消息（0 = 没压） */
   compacted: number;
+  /** v3 M3.5：本轮因 ask_parent 暂停时的问题；没有就是普通结束 */
+  question?: string;
 }
 
 export interface AgentOptions {
@@ -132,6 +152,10 @@ interface GraphRuntime {
   meter: TokenMeter | null;
   budgetTokens: number;
   delegate: DelegateContext | null;
+  /** v3 M3.5：子任务的父上下文；null = 没有父（ask_parent 不可用） */
+  parent: ParentContext | null;
+  /** v3 M3.5：本轮反问的问题；非空 = 本轮以暂停收尾 */
+  question: string | null;
   think: ThinkBudget;
   /** v3 M2：这一轮是谁 —— 选哪套绑定好的模型（工具 schema 按身份不同） */
   agent: AgentId;
@@ -150,6 +174,13 @@ interface GraphRuntime {
    * 不能用 `meter.inTok`：那是本轮的计量器，每轮第一次 callModel 时它还是 0。
    */
   prevInTok: number;
+  /**
+   * v4 M4.2b：本 thread 当前装载的 skill。只在**发送视图**里贴到用户消息末尾，
+   * 不进 state / checkpoint。null = 没装。
+   */
+  skill: LoadedSkill | null;
+  /** 装载器由 HiveAgent 注入（要按 thread 记住）；工具节点只负责调用 */
+  applySkill: (name: string) => LoadResult;
 }
 
 /** bindTools 之后的模型不再是 BaseChatModel 而是 Runnable，单独取个名 */
@@ -175,12 +206,47 @@ function asObj(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
 }
 
-/** 借调结果的统一话术（首跑与续跑共用） */
-function formatDelegateResult(res: HandoffResult, to: AgentId, budget: number): string {
+/**
+ * v4 性能：同一批里可以并发执行的工具（docs/V4-PERF-DESIGN.md §1）。
+ * 只读 / 无状态 —— 它们之间没有先后依赖；副作用工具保持串行。
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  'read_file',
+  'grep',
+  'glob',
+  'calculator',
+  'web_fetch',
+]);
+
+/** MCP 工具没有副作用声明，按名字保守判断：明确是写操作的就不并发 */
+const MCP_WRITE_HINT = /(write|edit|create|move|delete|remove|rename|append|mkdir|touch|link)/i;
+
+/**
+ * 这个工具能不能和同批的邻居并发跑。
+ * `ask_parent` / `load_skill` 改本轮 runtime，顺序敏感；`write/edit/bash` 有副作用；
+ * `delegate(parallel)` 内部已并发，不再套一层。
+ */
+export function canRunToolInParallel(name: string, args?: unknown): boolean {
+  if (name === 'ask_parent' || name === 'load_skill') return false;
+  if (name === 'delegate') return !Array.isArray(asObj(args)['parallel']);
+  if (PARALLEL_SAFE_TOOLS.has(name)) return true;
+  if (isMcpTool(name)) return !MCP_WRITE_HINT.test(name);
+  return false;
+}
+
+/** 借调结果的统一话术（首跑与续跑共用）。导出以便测试父侧提示文案 */
+export function formatDelegateResult(res: HandoffResult, to: AgentId, budget: number): string {
   if (!res.ok) return `ERROR: 借调 ${to}（${res.taskId}）未通过 —— ${res.notes ?? '（无说明）'}`;
   if (res.budgetHit) {
     // 明确告诉上层「是预算不够、不是任务失败」，让它加大预算重试（真机实测过这个坑）
     return `[${to}·${res.taskId}·熔断 ${res.tokens}/${budget} token] 子任务预算不足被熔断 —— 请加大 budgetTokens 再试。`;
+  }
+  // v3 M3.5：子任务中途反问 —— 把问题、taskId 与下一步调用形状一次说清
+  if (res.question) {
+    return (
+      `[${to}·${res.taskId} 暂停 ${res.tokens} token] 子任务需要你回答：${res.question}\n` +
+      `回答后用 delegate(resume="${res.taskId}", goal="<回答>", budgetTokens=<整数>) 继续。`
+    );
   }
   // v4 M4.1：结果里带 taskId —— 模型拿得到才谈得上「接着问」（不用再查 /handoffs）
   return `[${to}·${res.taskId} ${res.tokens} token] ${res.output || '（无可见输出）'}`;
@@ -383,6 +449,20 @@ async function handleDelegate(args: unknown, runtime: GraphRuntime): Promise<str
   return formatDelegateResult(res, input.to, input.budgetTokens);
 }
 
+/**
+ * v3 M3.5：ask_parent 的执行层接管。
+ * 不进网关（无副作用），只做三件事：确认有父、截断问题、标记本轮暂停。
+ */
+function handleAsk(raw: unknown, runtime: GraphRuntime): string {
+  const parent = runtime.parent;
+  if (!parent) return 'ERROR: 当前没有父会话（ask_parent 只在借调子任务里可用）';
+  const text = typeof asObj(raw)['question'] === 'string' ? (asObj(raw)['question'] as string) : '';
+  const q = clipQuestion(text);
+  if (!q) return 'ERROR: ask_parent 要给一个非空 question';
+  runtime.question = q;
+  return `[已暂停] 问题已转交 ${parent.from}（task ${parent.taskId}），等它用 delegate(resume=…) 回答。`;
+}
+
 /** 压缩后那条摘要消息的开头 —— 也用来识别「这条已经是摘要了」，别把摘要再摘要一遍 */
 export const SUMMARY_HEAD = '[已压缩的对话要点]';
 
@@ -500,6 +580,15 @@ function actionTarget(name: string, args: Record<string, unknown>): string {
       return pick('command');
     case 'delegate':
       return pick('to');
+    case 'web_fetch': {
+      // v4 M4.2b：网关比的是域名，不是完整 URL
+      const raw = pick('url');
+      try {
+        return new URL(raw).hostname.toLowerCase().replace(/\.$/, '');
+      } catch {
+        return raw;
+      }
+    }
     default:
       // v4 M4.2：MCP 工具名是 mcp__<server>__<tool>，网关的 target 是 server
       return mcpServerOf(name) ?? '';
@@ -602,7 +691,12 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     });
     if (packed.dropped > 0) runtime.compacted += packed.dropped;
 
-    const messages = [new SystemMessage(STABLE_PREFIX), ...packed.messages];
+    // v4 M4.2b：skill 只改**要发出去的那一份** —— state / checkpoint 一个字节不动。
+    // 与压缩同一条路：发送视图 ≠ 存下来的历史。
+    const messages = [
+      new SystemMessage(STABLE_PREFIX),
+      ...withSkill(packed.messages, runtime.skill),
+    ];
     debug('model', 'invoke', {
       agent: runtime.agent,
       think: runtime.think,
@@ -614,13 +708,65 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     return { messages: [reply] };
   };
 
+  /**
+   * v4 性能：单个工具调用。抽出来是为了让同批的只读调用能 `Promise.all`。
+   * 判定仍逐个走（身份 → 网关 → 落账），并行不等于绕过。
+   */
+  const runToolCall = async (
+    call: { name: string; args: Record<string, unknown>; id?: string },
+    agent: AgentId,
+    allowed: Set<string>,
+    runtime: GraphRuntime,
+  ): Promise<ToolMessage> => {
+    const name = call.name;
+    debug('tool', name, {
+      agent,
+      threadId: runtime.threadId,
+      ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
+    });
+    const fn = TOOL_MAP[name] as
+      | { invoke: (input: unknown) => Promise<unknown> }
+      | undefined;
+    let result: string;
+    if (!fn) {
+      result = `ERROR: 没有这个工具 ${name}`;
+    } else if (!allowed.has(name)) {
+      // 第一道门：这个身份有没有这件工具
+      result = `ERROR: 身份 ${agent} 没装工具 ${name}（/caps 看各身份装了什么）`;
+    } else {
+      // 第二道门：能力网关 —— 这一次准不准（拒绝会落账，且不进模型）
+      const blocked = gateToolCall(name, call.args, agent, runtime);
+      if (blocked) {
+        result = blocked;
+      } else if (isSkillTool(name)) {
+        // v4 M4.2b：装载只改本轮的发送视图（不入 state）；名字必须是冻结清单里的
+        const want = (call.args as { name?: unknown } | undefined)?.name;
+        const r = runtime.applySkill(typeof want === 'string' ? want : '');
+        if (r.ok) runtime.skill = r.skill;
+        result = r.msg;
+      } else if (isAskTool(name)) {
+        // v3 M3.5：反问只改本轮 runtime；afterTools 会把本轮收尾（暂停）
+        result = handleAsk(call.args, runtime);
+      } else if (name === 'delegate') {
+        // 借调走执行层：先令牌 + 预算，再由 runSubagent 跑
+        result = await handleDelegate(call.args, runtime);
+      } else {
+        try {
+          result = String(await fn.invoke(call.args));
+        } catch (e) {
+          result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+    }
+    return new ToolMessage({ content: result, tool_call_id: call.id ?? '' });
+  };
+
   const callTools = async (state: typeof StateAnnotation.State) => {
     const runtime = currentRuntime();
     const last = state.messages[state.messages.length - 1];
     const agent = runtime.agent;
     // v3 M2：判据是**身份**的 capability 装配，不再是模块的白名单
     const allowed = new Set(toolsFor(agent).map((t) => t.name));
-    const out: ToolMessage[] = [];
     const calls = isAIMessage(last as BaseMessage) ? ((last as AIMessage).tool_calls ?? []) : [];
 
     // v3 M2.5：这里只计数 —— 拦在「tools 之后回不回 agent」那条条件边（见 afterTools）。
@@ -628,39 +774,25 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
     // 计数与「限不限」无关：0 = 不限时也数，只是不拦。
     runtime.steps += 1;
 
-    for (const call of calls) {
-      const name = call.name;
-      debug('tool', name, {
-        agent,
-        threadId: runtime.threadId,
-        ...(runtime.taskId ? { taskId: runtime.taskId } : {}),
-      });
-      const fn = TOOL_MAP[name] as
-        | { invoke: (input: unknown) => Promise<unknown> }
-        | undefined;
-      let result: string;
-      if (!fn) {
-        result = `ERROR: 没有这个工具 ${name}`;
-      } else if (!allowed.has(name)) {
-        // 第一道门：这个身份有没有这件工具
-        result = `ERROR: 身份 ${agent} 没装工具 ${name}（/caps 看各身份装了什么）`;
+    // v4 性能：连续的只读调用合成一组并发；副作用工具是一道屏障，
+    // 之后的组再重新开始 —— 写后读的顺序不会被并行打乱。
+    const out: ToolMessage[] = new Array(calls.length);
+    let i = 0;
+    while (i < calls.length) {
+      const call = calls[i]!;
+      if (canRunToolInParallel(call.name, call.args)) {
+        let j = i + 1;
+        while (j < calls.length && canRunToolInParallel(calls[j]!.name, calls[j]!.args)) j += 1;
+        const group = calls.slice(i, j);
+        const done = await Promise.all(group.map((c) => runToolCall(c, agent, allowed, runtime)));
+        done.forEach((m, k) => {
+          out[i + k] = m;
+        });
+        i = j;
       } else {
-        // 第二道门：能力网关 —— 这一次准不准（拒绝会落账，且不进模型）
-        const blocked = gateToolCall(name, call.args, agent, runtime);
-        if (blocked) {
-          result = blocked;
-        } else if (name === 'delegate') {
-          // 借调走执行层：先令牌 + 预算，再由 runSubagent 跑
-          result = await handleDelegate(call.args, runtime);
-        } else {
-          try {
-            result = String(await fn.invoke(call.args));
-          } catch (e) {
-            result = `ERROR: ${e instanceof Error ? e.message : String(e)}`;
-          }
-        }
+        out[i] = await runToolCall(call, agent, allowed, runtime);
+        i += 1;
       }
-      out.push(new ToolMessage({ content: result, tool_call_id: call.id ?? '' }));
     }
     return { messages: out };
   };
@@ -679,6 +811,8 @@ function buildGraph(models: Record<ThinkBudget, BaseChatModel>, checkpointer: Ba
    * 而不是带 tool_calls 的 AIMessage（否则下一次请求会被模型侧拒）。
    */
   const afterTools = (): 'agent' | typeof END => {
+    // v3 M3.5：反问 = 本轮以暂停收尾，不再让模型继续（否则它会自问自答）
+    if (currentRuntime().question) return END;
     const max = toolSteps();
     return max > 0 && currentRuntime().steps >= max ? END : 'agent';
   };
@@ -707,6 +841,28 @@ export class HiveAgent {
    * 不能拿本轮 meter 当尺子（它是本轮的，第一次调用时是 0）。
    */
   private readonly prevInTok = new Map<string, number>();
+
+  /**
+   * v4 M4.2b：每个 thread 当前装载的 skill。按 thread 存 —— 新会话（/new）换 thread，
+   * 等于没装（与历史一样冷启动）。
+   */
+  private readonly skillByThread = new Map<string, LoadedSkill>();
+
+  skillOf(threadId: string): LoadedSkill | null {
+    return this.skillByThread.get(threadId) ?? null;
+  }
+
+  /** 装载并记住。未知名字原样返回原因（带可用清单） */
+  loadSkill(threadId: string, name: string): LoadResult {
+    const r = loadSkillByName(name);
+    if (r.ok) this.skillByThread.set(threadId, r.skill);
+    return r;
+  }
+
+  /** 卸载。返回 false = 本来就没装 */
+  clearSkill(threadId: string): boolean {
+    return this.skillByThread.delete(threadId);
+  }
 
   private readonly graph: ReturnType<typeof buildGraph>;
 
@@ -754,6 +910,8 @@ export class HiveAgent {
       meter,
       budgetTokens: req.budgetTokens ?? 0,
       delegate: req.delegate ?? null,
+      parent: req.parent ?? null,
+      question: null,
       think: req.module.think,
       agent: req.agent,
       ledger: req.ledger ?? null,
@@ -763,6 +921,9 @@ export class HiveAgent {
       steps: 0,
       compacted: 0,
       prevInTok: this.prevInTok.get(req.threadId) ?? 0,
+      // v4 M4.2b：skill 按 thread 记住，但只影响发送视图
+      skill: this.skillOf(req.threadId),
+      applySkill: (name: string) => this.loadSkill(req.threadId, name),
     };
 
     return this.graph.withRuntime(rt, async () => {
@@ -803,6 +964,7 @@ export class HiveAgent {
             denied: rt.denied,
             steps: rt.steps,
             compacted: rt.compacted,
+            ...(rt.question ? { question: rt.question } : {}),
           };
         }
         throw e;
@@ -819,6 +981,7 @@ export class HiveAgent {
         denied: rt.denied,
         steps: rt.steps,
         compacted: rt.compacted,
+        ...(rt.question ? { question: rt.question } : {}),
       };
     });
   }

@@ -6,7 +6,7 @@
 
 ## 0. 现在的成熟度（2026-10-19 事实）
 
-- `npm test`：**177 个测试全绿**（全部零 API）
+- `npm test`：**244 个测试全绿**（全部零 API）
 - M3.1 真机验收通过：A→C 首跑写入、`/delegate --continue` 续同一子会话改写、
   `/handoffs` 两行同 taskId、`/ledger agents` 按身份汇总。成本约 **$0.0006**
 - 已具备：缓存友好前缀、按身份装配的 8 个工具、能力网关（L1）、
@@ -31,11 +31,12 @@
 | 现状 | 产品级要求 | 差距 |
 |---|---|---|
 | capability 硬编码在 `capability.ts` 的注册表 | 第三方 capability 可注册，不改核心 | 无插件边界、无版本、无生命周期 |
-| `web` / `skill` 只声明未实现 | `fetch`（域名白名单）与 playbook 装载 | 0 个工具 |
+| **已做（M4.2b）**：`web` 只声明未实现 | `fetch`（域名白名单） | 已落地：`web_fetch` + `web.allowDomains`，见 `V4-M4.2B-WEB-DESIGN.md` |
+| **已做（M4.2b）**：`skill` 只声明未实现 | follow-up：skill 文本贴尾、不进前缀 | 已落地，见 `V4-M4.2B-DESIGN.md` |
 | **已接 MCP（M4.2a）** | 能接任意 MCP server，工具按 server 动态装配 | 见 `src/core/mcp.ts`；启动时冻结清单，`mcp.allowServers` 收权 |
 | **provider 已配置化（M4.2a）** | 模型 / 端点 / 价格可配 | `DEEPSEEK_BASE_URL` / `HIVE_PRICE_JSON`；按拍板不做多 provider 适配层 |
 | agent / 模块定义写死在 `modules.ts` | 从配置读 agent 定义（能力、主模块、mayCall） | 加一个身份要改源码 |
-| 无 skill | 装载 playbook（把一段方法论文本临时挂到尾部） | 与"前缀不变"约束的交互未设计 |
+| **已做（M4.2b）**：无 skill | 装载 playbook（把一段方法论文本临时挂到尾部） | 贴发送视图末尾，不进 checkpoint |
 
 ### 1.3 可协调 —— 多个 agent 能不能真协作
 
@@ -43,7 +44,7 @@
 |---|---|---|
 | 图 runtime 是**单个闭包变量**（`agent.ts:433`），一次只有一个活跃 run | 多个子任务可并发跑，各自计量、各自预算 | 必须改成每 run 独立 runtime（见 §3.1） |
 | `delegate` 串行：A 派完 B 才能派 D | A 可同时派 B 和 D，再汇总 | 无并发调度、无结果合并 |
-| 子会话只能父驱动 | B 可主动反问 A / 请求补充信息 | 无回调通道（M3.5 遗留） |
+| **已做（M3.5）**：子会话只能父驱动 | B 可主动反问 A / 请求补充信息 | `ask_parent` + 暂停-续跑，见 `V3-M3.5-DESIGN.md` |
 | taskId 只落账本，模型看不到 | 首跑结果里带 taskId，模型能自己续 | `formatDelegateResult` 没输出 taskId |
 | 无任务列表 / 取消 / 超时 | `/tasks` 看运行中与已完成；可取消 | 无任务生命周期 |
 | `@B` 寻址 / 广播 | **不做**（V3-PLAN §7 已拍板不上总线） | — |
@@ -94,7 +95,38 @@ taskId；总花费约 $0.0007。零 API 测试另加 9 项（并发 4 + 任务�
 3. **身份级开关**：`mcp.agents` 指定哪些身份装 MCP；`.hive/policy.json` 的
    `agents.X.mcp = "deny"` 可再收紧（身份 deny 优先于 server 白名单）。
 
-仍待做（M4.2b）：
+已完成（M4.2b，2026-10-25，设计见 `docs/V4-M4.2B-DESIGN.md`）：
+
+1. **skill 装载**：`hive.config.json` 的 `skills.dir`（默认 `.hive/skills`）启动时读入
+   这一层 `*.md` 并冻结清单；`load_skill` 工具（按 `skills.agents` 装配）+ `/skill`
+   命令；文本只贴**发送视图**里最后一条 HumanMessage，不进 system 前缀、不进 checkpoint。
+
+2. **web fetch**：`hive.config.json` 的 `web.allowDomains` + `web.agents`；
+   `web_fetch` 只 GET / 默认端口 / 拒 IP 与私网（DNS 全地址检查）/ 重定向逐跳校验 /
+   只读文本类型，字节、超时、跳数都有上限。232 个零 API 测试全绿（新增 27）。
+   设计见 `docs/V4-M4.2B-WEB-DESIGN.md`。
+
+M4.2b 无剩余项。
+
+### M3.5 反问：B 主动反问 A（2026-10-27 完成）
+
+1. **`ask_parent` 工具**：B/C/D 在子任务里信息不够时把问题交回父会话；本轮暂停
+   （`afterTools` 遇 question 直接 END，不让模型自问自答），问题随
+   `TurnResult.question` → `HandoffResult.question` 回到父层。
+2. **父侧续跑**：`formatDelegateResult` 输出 `[B·taskId 暂停] …` +
+   `delegate(resume=…, goal=回答)` 的调用形状；父回答后复用 M3 的同一子 thread。
+3. **边界**：A 没有父、不装这件工具；独立会话调它只得到一句 ERROR；
+   问题截到 2000 字符；`ask` 能力追加在 `CAPABILITY_ORDER` 末尾（不改变前面字节）。
+4. 240 个零 API 测试全绿（新增 8）。设计见 `docs/V3-M3.5-DESIGN.md`。
+
+### 性能：批内并行（2026-10-27 完成）
+
+1. **`callTools` 安全分组**：同一批里只读工具（`read_file` / `grep` / `glob` /
+   `calculator` / `web_fetch`、MCP 只读工具、互不依赖的 `delegate`）用 `Promise.all`
+   并发；写操作与顺序敏感工具串行并作为屏障，写后读不会被打乱。
+2. **`connectMcp` 并行连接**：启动时间从各 server 之和变成最大值。
+3. **模型批量引导**：`delegate` 描述提示把独立子任务放进同一批。
+4. 244 个零 API 测试全绿（新增 4）。设计见 `docs/V4-PERF-DESIGN.md`。
 
 ### M4.3 可工作：中断、恢复、初始化（2026-10-19 完成）
 
@@ -163,7 +195,7 @@ skill 都是一次全盘缓存作废。skill 文本按需装载，不进 checkpo
 ## 6. 产品级验收标准
 
 1. 干净机器：`npm i -g hive-agents` → `hive init` → `hive doctor` → 真机一轮，全程不需要手写 `.env`
-2. CI 在 Windows/Linux/macOS 全绿（typecheck + 177+ 测试 + build）
+2. CI 在 Windows/Linux/macOS 全绿（typecheck + 244 测试 + build）
 3. 并行借调：零 API 并发测试 + 一次真机（两个子任务同时跑，账本各自独立）
 4. [x] 至少一个真实 MCP server 能接上并调用（M4.2a：fixture echo / sum）
 5. Ctrl+C 能停当前轮且会话不丢

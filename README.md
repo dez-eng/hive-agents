@@ -35,7 +35,7 @@ printf 'DEEPSEEK_API_KEY=sk-你的key\n' > .env
 
 ```bash
 hive                      # 交互会话（主控 A）
-hive init                 # 生成 .env.example / .hive/policy.json / hive.config.example.json
+hive init                 # 生成 .env.example / .hive/policy.json / hive.config.example.json / .hive/skills/example.md
 hive --as B               # 以侦察身份独立启动；会话挂在 solo#B 上，可以续
 hive --as C --continue    # 续 C 上一次的独立会话
 hive run "3*7 等于几"      # 单轮，适合脚本
@@ -58,7 +58,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 
 ---
 
-## 八个工具，按身份装配
+## 工具按身份装配
 
 工具不写死在模块表里，而由 capability 声明式装配（`AGENTS[i].capabilities` → 该身份的工具集）。
 **装了 ≠ 准干** —— 能不能用由能力网关判（下一节）。
@@ -71,16 +71,19 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `shell` | `bash` | **默认全拒**，见「沙箱」一节 |
 | `delegate` | `delegate` | 借调 / 续跑同一子会话 / `parallel` 并发交办（令牌 + 预算闸门） |
 | `mcp` | `mcp__<server>__<tool>` | 外部 MCP server（启动时冻结清单；`mcp.allowServers` 白名单） |
-| `web` `skill` | — | 只声明，还没实现（贡献 0 token） |
+| `skill` | `load_skill` | 装载方法论文本（清单启动时冻结；**文本贴用户消息末尾，不进前缀**） |
+| `ask` | `ask_parent` | 子任务中途向父会话提问（本轮暂停；父用 `delegate(resume=…)` 回答） |
+| `web` | `web_fetch` | GET 网页 / HTTP 文本；**默认不装**，配 `web.allowDomains` 才装配（域名白名单 + 只读文本 + 字节上限） |
 
-各身份每轮为工具 schema 付的钱（`/caps` 随时可查；下表不含 MCP —— MCP 工具按配置动态增加）：
+各身份每轮为工具 schema 付的钱（`/caps` 随时可查；下表只算默认装配的内置工具 ——
+MCP、`load_skill` 与 `web_fetch` 按配置动态增加）：
 
 | 身份 | 工具数 | 字符/轮 |
 |---|---|---|
-| A 主控 | 8 | 3070 |
-| B 侦察 | 7 | 2827 |
-| C 修复 | 4 | 1312 |
-| D 审计 | 6 | 2109 |
+| A 主控 | 8 | 3615 |
+| B 侦察 | 8 | 3644 |
+| C 修复 | 5 | 1584 |
+| D 审计 | 7 | 2381 |
 
 ---
 
@@ -158,6 +161,76 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
   `agents.X.mcp = "deny"` 可以再收紧（身份 deny 优先于 server 白名单）。
 - 连不上的 server 只报一条警告，不影响 hive 启动。
 
+## skill：装载方法论文本
+
+`hive.config.json` 里指定目录（默认 `.hive/skills`），启动时把这一层的 `*.md` 读进内存并冻结：
+
+```json
+{
+  "skills": { "dir": ".hive/skills", "agents": ["A"] }
+}
+```
+
+- 文件名（去 `.md`）= skill 名；第一条 `# ` 行 = 标题；单个文件默认 ≤ 64KB
+  （`HIVE_SKILL_MAX_BYTES`）
+- 两个装载入口：模型调 `load_skill({name})`，或人敲 `/skill load <name>`；`/skill list` 看清单，
+  `/skill off` 卸载
+- **贴在用户消息末尾，不另起一条**：它不进 system 前缀（否则一次装载 = 全盘缓存作废），
+  也不进 checkpoint（`/history` 里看不到全文）。与角色片同侧，边际成本 ≈ 0
+- 只接受冻结清单里的名字，不做路径拼接 —— 不存在任意读取；清单启动时冻结，改文件要重启
+- `skills.agents` 之外的身份不装这件工具；没配 `skills.dir` 时 0 个工具、0 token
+
+继续往下看之前先记住这条：**skill 是方法论，不是权限**。它能改模型的做事方式，
+不能让它多读一个文件。
+
+## web：取网页（域名白名单）
+
+`hive.config.json` 里配白名单与装它的身份；没写这一段 = 0 工具 = 0 token：
+
+```json
+{
+  "web": {
+    "allowDomains": ["example.com", "*.wikipedia.org"],
+    "agents": ["A"]
+  }
+}
+```
+
+- 白名单并入 policy 的 `net.allowDomains`；`HIVE_POLICY_NET` 设了就以环境变量为准。
+  `*.example.com` 匹配裸域与任意子域，`*` = 不限（自担风险）
+- 工具只做 GET、只走 http/https 默认端口、不带 userinfo；**域名解析到内网/回环地址直接拒绝**
+- 重定向最多 5 跳，**每一跳重新过白名单 + 私网检查**；跨域跳转不豁免
+- 只读 `text/*`、JSON、XML；其它类型只回元信息。字节上限 `HIVE_WEB_MAX_BYTES`（默认 2MiB），
+  超时 `HIVE_WEB_TIMEOUT_MS`（默认 15s）
+- 网关判定是 `net` 动作、target 是 hostname：`/policy log` 能看到每次 allow / deny
+
+不做 POST、认证头、Cookie、浏览器渲染、HTML 转 Markdown —— 那些交给 MCP server。
+
+## 子任务反问：`ask_parent`
+
+B/C/D 在子任务里信息不够时，可以调 `ask_parent({question})` 把问题交回父会话：
+
+- 本轮**暂停**（不再让模型继续，避免自问自答），问题随 `HandoffResult.question` 回到父层
+- 父模型看到 `[B·t003-abcd 暂停] 子任务需要你回答：…` 后，用
+  `delegate(resume="t003-abcd", goal="<回答>", budgetTokens=…)` 继续同一个子会话
+- 是**暂停-续跑**，不是并发回调：父模型不必在子任务运行中待命（那会死锁），
+  子任务让出控制权、拿到补充信息后再继续
+- A 没有父，不装这件工具；独立会话（`hive --as B`）调它会被拒
+- 设计见 `docs/V3-M3.5-DESIGN.md`
+
+## 性能：把往返时间压到最低
+
+- **批内并行**：模型一次返回多个工具调用时，只读的（`read_file` / `grep` / `glob` /
+  `calculator` / `web_fetch`、MCP 只读工具、互不依赖的 `delegate`）会**并发执行**；
+  写操作（`write_file` / `edit_file` / `bash`）与顺序敏感工具（`load_skill` /
+  `ask_parent`）保持串行 —— 写后读不会被抢跑，写是一道屏障。
+- **子任务并行**：一次给多个 `delegate`（或 `parallel`），子任务同时跑；
+  各自独立 thread、独立预算、独立账本行。
+- **MCP 并行连接**：启动时各 server 同时握手，启动时间取最大值而不是求和。
+- 三个可调旋钮：`mcp.agents`（只给 A 装 MCP，前缀从 1.6 万字符降下来）、
+  模块的 `think` 档（B/D 默认 `high`，可按任务降）、`HIVE_TOOL_STEPS`（批数上限）。
+- 设计见 `docs/V4-PERF-DESIGN.md`。
+
 ## 多 agent：A 主 + B/C/D 副，每个都能单独启动
 
 | 身份 | 角色 | 主模块 | 可借调 | 单独启动 |
@@ -186,7 +259,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 
 ---
 
-## 命令（28 个）
+## 命令（29 个）
 
 | 命令 | 作用 |
 |---|---|
@@ -201,6 +274,7 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `/delegate <身份> <目标>` ／ `/delegate --continue <taskId> <追加>` | 交办一次 / 续跑同一子会话（taskId 见 `/handoffs`）；模型调工具时还支持 `parallel` 并发 |
 | `/tasks [n]` | 本次进程的子任务：运行中/完成/熔断/拒绝、预算与耗时（历史看 `/handoffs`） |
 | `/mcp` | MCP server 与工具清单（启动时冻结；改配置后重启生效） |
+| `/skill [list\|load <name>\|off]` | skill 清单 / 装载 / 卸载（文本贴用户消息末尾，不进前缀、不进 checkpoint） |
 | `/grant <身份> <预算>` `/budget` `/handoffs [n]` | 令牌、余额、交接记录（记录里带子会话 thread） |
 | `/tail on\|off` `/status on\|off` | 尾部角色片开关 / 底部状态行开关 |
 | `/new` `/history` | 开新会话（冷缓存） / 存档点 |
@@ -234,6 +308,10 @@ hive doctor               # 环境自检（账本、策略、工具 schema 字�
 | `DEEPSEEK_BASE_URL` | — | 自定义 DeepSeek 兼容端点（不设走官方） |
 | `HIVE_PRICE_JSON` | — | 覆盖内置价表（JSON；写坏退回内置价） |
 | `HIVE_POLICY_MCP` | — | MCP server 白名单（逗号分隔；优先于配置文件） |
+| `HIVE_SKILL_MAX_BYTES` | `65536` | 单个 skill 文件的上限；超限跳过并警告 |
+| `HIVE_WEB_MAX_BYTES` | `2097152` | `web_fetch` 单次响应字节上限；超限截断并标注 |
+| `HIVE_WEB_TIMEOUT_MS` | `15000` | `web_fetch` 超时（整条重定向链共用一个） |
+| `HIVE_WEB_MAX_REDIRECTS` | `5` | `web_fetch` 最多跟随几跳；每一跳重新过白名单 |
 | `HIVE_DEBUG` | 空 | `1` 时输出 model/tool/mcp/ledger 调试日志到 stderr |
 
 ## 账本
@@ -278,13 +356,14 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v4 M4.1 协调：并行借调（`parallel`）+ 每 run 独立 runtime + `/tasks`
 - [x] v4 M4.2a 扩展：MCP（stdio + 动态工具 + policy）+ DeepSeek 配置化
 - [x] v4 M4.3 可工作：Ctrl+C 只停当前轮、错误分类、`hive init`、busy_timeout、`HIVE_DEBUG`
-- [ ] v4 M4.2b 扩展：`skill` / `web`
-- [ ] v3 M3.5 剩余：B 主动反问 A、`@` 寻址
+- [x] v4 M4.2b 扩展：`skill` 装载（`skills.dir` + `load_skill` + `/skill`，贴尾不进前缀/checkpoint）
+- [x] v4 M4.2b 剩余：`web_fetch`（域名白名单 + 私网拦截 + 字节上限，默认不装）
+- [x] v3 M3.5：B 主动反问 A（`ask_parent` + 暂停-续跑）
 - [x] v4 M4.4 发布工程：三平台 CI、CHANGELOG、CONTRIBUTING
 - [ ] npm 0.1.0 发布（只差 6 位 OTP）
 - [ ] 以后：容器级隔离
 
-设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN）。
+设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN、V4-PLAN、V4-M4.2B-DESIGN）。
 
 ## License
 

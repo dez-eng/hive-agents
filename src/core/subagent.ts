@@ -174,6 +174,7 @@ async function executeInner(o: ExecuteOptions): Promise<HandoffResult> {
   let ok = true;
   let output: string | undefined;
   let notes: string | undefined;
+  let question: string | undefined;
 
   try {
     const req: TurnRequest = {
@@ -187,6 +188,8 @@ async function executeInner(o: ExecuteOptions): Promise<HandoffResult> {
       agent: o.as,
       ledger: o.deps.ledger,
       taskId: o.taskId,
+      // v3 M3.5：子任务知道自己有父 —— ask_parent 用它（from / taskId）
+      parent: { from: o.from, taskId: o.taskId },
       ...(childDelegate ? { delegate: childDelegate } : {}),
     };
     const res = await o.deps.runner.run(req, o.onChunk);
@@ -194,7 +197,10 @@ async function executeInner(o: ExecuteOptions): Promise<HandoffResult> {
     costUsd = res.meter.cost();
     budgetHit = res.budgetHit;
     if (res.text) output = res.text;
+    // v3 M3.5：子任务反问 —— 透传给父层，父用 resume 回答
+    if (res.question) question = res.question;
     if (budgetHit) notes = '被预算闸门熔断';
+    else if (question) notes = '暂停等上级回答';
     logTurn(o.as, o.taskId, o.deps.module, o.deps.ledger, res.meter, o.thread, budget, budgetHit);
   } catch (e) {
     if (isBudgetExceeded(e)) {
@@ -237,6 +243,7 @@ async function executeInner(o: ExecuteOptions): Promise<HandoffResult> {
     budgetHit,
     ...(notes ? { notes } : {}),
     thread: o.thread,
+    ...(question ? { question } : {}),
   };
 }
 

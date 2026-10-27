@@ -17,8 +17,10 @@ import { parsePriceOverlay, setPriceOverlay } from './core/cost.js';
 import { classifyError } from './core/errors.js';
 import { initFiles } from './core/init.js';
 import { activateMcp, connectMcp, setMcpSummary, type McpConnection } from './core/mcp.js';
-import { setMcpAllowServers } from './core/policy.js';
+import { setMcpAllowServers, setNetAllowDomains } from './core/policy.js';
 import { loadSettings } from './core/settings.js';
+import { activateSkills, scanSkills } from './core/skill.js';
+import { activateWeb } from './core/web.js';
 import { DEFAULT_AGENT, DEFAULT_MODULE, getAgent, getModule } from './core/modules.js';
 import { parse, resolveAs } from './core/args.js';
 import { soloThread } from './core/handoff.js';
@@ -108,6 +110,25 @@ async function main(): Promise<number> {
       tools: mcp.tools.length,
       agents: enabled,
     });
+  }
+
+  // v4 M4.2b：skill 清单在启动时冻结（与 MCP 同一条自律）。
+  // 必须在 buildContext 之前 —— load_skill 这件工具进的是身份的工具集。
+  const skillsCfg = settings.spec.skills;
+  if (skillsCfg) {
+    const scan = scanSkills(skillsCfg.dir);
+    for (const w of scan.warnings) process.stderr.write(`${w}\n`);
+    activateSkills(scan, skillsCfg.agents);
+  }
+
+  // v4 M4.2b 剩余项：web_fetch 只在配了 web 段时注册（没配 = 0 工具 = 0 token）。
+  // 白名单并入 policy；HIVE_POLICY_NET 设了就以 env 为准（与 mcp.allowServers 同一条）。
+  const webCfg = settings.spec.web;
+  if (webCfg) {
+    if (webCfg.allowDomains.length && !(process.env.HIVE_POLICY_NET ?? '').trim()) {
+      setNetAllowDomains(webCfg.allowDomains);
+    }
+    activateWeb(webCfg.agents);
   }
 
   if (mode === 'doctor') {

@@ -42,6 +42,11 @@ export const HandoffResultSchema = z.object({
    * 可选是为了兼容 M3 之前的调用方。
    */
   thread: z.string().optional(),
+  /**
+   * v3 M3.5：子任务中途反问时的问题。父回答后用
+   * `delegate(resume=taskId, goal=回答)` 继续同一个子会话。
+   */
+  question: z.string().optional(),
 });
 
 export type HandoffInput = z.infer<typeof HandoffInputSchema>;

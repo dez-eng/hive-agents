@@ -58,17 +58,45 @@ export const CONFIG_EXAMPLE = `${JSON.stringify(
       agents: ['A'],
       allowServers: [],
     },
+    skills: {
+      dir: '.hive/skills',
+      agents: ['A'],
+    },
+    web: {
+      // 例：'example.com' / '*.wikipedia.org'；空数组 = 工具会装、调用全拒
+      allowDomains: [],
+      agents: ['A'],
+    },
     price: {},
   },
   null,
   2,
 )}\n`;
 
+/** 示例 skill —— 同时演示格式与「贴尾」的用法；不装载就不产生任何 token */
+export const SKILL_EXAMPLE = `# 示例 skill：代码复核
+
+这是一个最小示例。用 \`/skill load example\` 装载后，这段文本会贴在本轮用户消息末尾；
+它不进 system 前缀，也不进 checkpoint。
+
+## 何时用
+
+让模型按固定清单复核一份改动，而不是自由发挥。
+
+## 步骤
+
+1. 先读 diff，只看改动的行
+2. 对每一处改动问：输入边界变了吗？错误路径变了吗？
+3. 只报「有证据的问题」，每条带文件与行号
+4. 没发现问题就说没发现
+`;
+
 export function initFiles(dir = process.cwd(), opts: { force?: boolean } = {}): InitResult {
   const files: InitFile[] = [
     { path: '.env.example', content: ENV_EXAMPLE },
     { path: '.hive/policy.json', content: POLICY_EXAMPLE },
     { path: 'hive.config.example.json', content: CONFIG_EXAMPLE },
+    { path: '.hive/skills/example.md', content: SKILL_EXAMPLE },
   ];
 
   const written: string[] = [];

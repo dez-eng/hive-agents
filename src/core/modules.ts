@@ -24,7 +24,7 @@ export type AgentId = 'A' | 'B' | 'C' | 'D';
  * `shell` / `web` / `skill` M2 只声明、不实现（贡献 0 个工具）。
  * `calc` 是 v3 补的第 7 个 —— 原来挂在模块表里的算数工具也得有个归属。
  */
-export type CapabilityId = 'fs' | 'search' | 'calc' | 'shell' | 'web' | 'skill' | 'delegate' | 'mcp';
+export type CapabilityId = 'fs' | 'search' | 'calc' | 'shell' | 'web' | 'skill' | 'delegate' | 'mcp' | 'ask';
 
 export interface AgentModule {
   /** 唯一 id，命令里用 /use <id> 切 */
@@ -135,7 +135,8 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     home: 'recon',
     // fs 是 M2 补上的：侦察必须能读文件（V3-PLAN §1 第 2 条硬伤）；
     // 写权限由 policy 收（默认 deny），不是靠不给工具
-    capabilities: ['fs', 'search', 'delegate', 'shell'],
+    // v3 M3.5：可被借调，于是需要 `ask_parent` 中途向父提问
+    capabilities: ['fs', 'search', 'delegate', 'shell', 'ask'],
     think: 'high',
     mayCall: ['C', 'D'],
     standalone: true,
@@ -145,7 +146,7 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     id: 'C',
     title: '修复',
     home: 'fix',
-    capabilities: ['fs', 'shell'],
+    capabilities: ['fs', 'shell', 'ask'],
     think: 'low',
     mayCall: [],
     standalone: true,
@@ -155,7 +156,7 @@ export const AGENTS: Record<AgentId, AgentSpec> = {
     id: 'D',
     title: '审计',
     home: 'audit',
-    capabilities: ['fs', 'search', 'shell'],
+    capabilities: ['fs', 'search', 'shell', 'ask'],
     think: 'high',
     mayCall: [],
     standalone: true,

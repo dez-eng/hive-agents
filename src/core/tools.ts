@@ -196,7 +196,8 @@ export const delegateTool = tool(
     name: 'delegate',
     description:
       '把子任务交给另一个 agent（需 A 签发的令牌，受预算闸门限制）。预算给足，太小会在子任务里被熔断。' +
-      '给 resume 则在同一子会话里续跑；给 parallel 则并发交办多个子任务。',
+      '给 resume 则在同一子会话里续跑；给 parallel 则并发交办多个子任务。' +
+      '多个互不依赖的子任务放在同一批调用里（一次返回多个 delegate），它们会并行执行 —— 不要一个一个等。',
     schema: z.object({
       to: z
         .enum(['A', 'B', 'C', 'D'])

@@ -19,6 +19,7 @@ import { AGENTS, type AgentId, type CapabilityId } from './modules.js';
 import type { ActionKind } from './policy.js';
 import { globTool, grepTool } from './search.js';
 import { bashTool } from './bash.js';
+import { askParentTool } from './dialog.js';
 import { calculator, delegateTool, editFileTool, readFileTool, writeFileTool } from './tools.js';
 
 /** 工具在 capability 层里的统一身份（`tool()` 造出来的都是它） */
@@ -48,6 +49,8 @@ export const CAPABILITY_ORDER: CapabilityId[] = [
   'skill',
   // v4 M4.2：MCP 追加在**最后** —— 顺序即前缀顺序，追加只影响装了它的 agent
   'mcp',
+  // v3 M3.5：ask 追加在最后 —— 追加不改变前面任何字节，已命中的前缀仍命中
+  'ask',
 ];
 
 export const CAPABILITIES: Record<CapabilityId, Capability> = {
@@ -86,19 +89,21 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
     tools: [bashTool],
     needs: ['exec'],
   },
-  // ── 以下两个仍只声明、不实现（M2.5 已经把 shell 落地了）：贡献 0 个工具 = 0 token，
-  //    `/caps` 会明说「声明了、还没实现」，比凭空冒出一个能力要好。
+  // ── v4 M4.2b：`web_fetch` 在启动时按 `web.allowDomains` 注册；没配 = 0 工具 = 0 token。
+  //    `/caps` 会把它列进「声明了、还没工具」的能力里，直到配置打开。
   web: {
     id: 'web',
     title: 'web',
-    summary: '（声明，未实现）取网页',
+    summary: 'GET 网页/HTTP 文本（域名白名单在 policy 的 net.allowDomains）',
     tools: [],
     needs: ['net'],
   },
+  // v4 M4.2b：`load_skill` 在启动时按 `skills.dir` 注册；没配 = 0 工具 = 0 token。
+  // skill 文本本身不进前缀（贴用户消息末尾），只有这件工具的 schema 是前缀的一部分。
   skill: {
     id: 'skill',
     title: 'skill',
-    summary: '（声明，未实现）装载 playbook',
+    summary: '装载 playbook（贴用户消息末尾；清单启动时冻结）',
     tools: [],
     needs: [],
   },
@@ -109,6 +114,15 @@ export const CAPABILITIES: Record<CapabilityId, Capability> = {
     summary: '外部 MCP server 提供的工具（启动时冻结清单；server 白名单见 /policy）',
     tools: [],
     needs: ['mcp'],
+  },
+  // v3 M3.5：`ask_parent` 是静态工具 —— 装它的身份每轮多一件 schema；
+  // 只在子任务里有效（A 没有父，默认不装）。
+  ask: {
+    id: 'ask',
+    title: '反问',
+    summary: '子任务中途向父会话提问（本轮暂停，父用 delegate(resume) 回答）',
+    tools: [askParentTool],
+    needs: [],
   },
 };
 
@@ -132,12 +146,16 @@ export function mcpToolName(server: string, tool: string): string {
   return `${MCP_TOOL_PREFIX}${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, '_');
 }
 
-/** 启动时把连上的 MCP 工具装进 capability 注册表 */
-export function registerMcpTools(tools: AnyTool[]): void {
-  // TOOL_MAP / ALL_TOOLS 是模块加载时按 CAPABILITIES 算出来的常量对象/数组。
-  // 动态注册后必须同步：执行层按 TOOL_MAP 分派，不同步就会说「没有这个工具」。
-  const old = CAPABILITIES.mcp.tools.map((t) => t.name);
-  CAPABILITIES.mcp.tools = tools;
+/**
+ * 启动时把动态工具装进 capability 注册表（MCP / skill 共用）。
+ *
+ * TOOL_MAP / ALL_TOOLS 是模块加载时按 CAPABILITIES 算出来的常量对象/数组。
+ * 动态注册后必须同步：执行层按 TOOL_MAP 分派，不同步就会说「没有这个工具」。
+ * **顺序保持注册表顺序**：工具顺序 = 前缀顺序，别顺手排序。
+ */
+export function registerCapabilityTools(id: CapabilityId, tools: AnyTool[]): void {
+  const old = CAPABILITIES[id].tools.map((t) => t.name);
+  CAPABILITIES[id].tools = tools;
   for (const name of old) {
     delete TOOL_MAP[name];
     const i = ALL_TOOLS.findIndex((t) => t.name === name);
@@ -147,6 +165,11 @@ export function registerMcpTools(tools: AnyTool[]): void {
     TOOL_MAP[t.name] = t;
     if (!ALL_TOOLS.some((x) => x.name === t.name)) ALL_TOOLS.push(t);
   }
+}
+
+/** 启动时把连上的 MCP 工具装进 capability 注册表 */
+export function registerMcpTools(tools: AnyTool[]): void {
+  registerCapabilityTools('mcp', tools);
 }
 
 /**
@@ -173,6 +196,8 @@ const TOOL_ACTION: Record<string, ActionKind> = {
   glob: 'fs.read',
   bash: 'exec',
   delegate: 'delegate',
+  // v4 M4.2b：target 是 hostname（agent.ts 的 actionTarget 负责解析）
+  web_fetch: 'net',
 };
 
 export function kindOf(tool: string): ActionKind | undefined {
@@ -234,7 +259,7 @@ export function toolsCharsFor(agent: AgentId): number {
   return toolsChars(toolsFor(agent));
 }
 
-/** 声明了但一个工具都没有的 capability（web / skill）；MCP 是「还没配 server」，不算 */
+/** 声明了但当前还没有工具的 capability（skill 未配 / web 未配）；MCP 是「还没配 server」，不算 */
 export function declaredOnly(): CapabilityId[] {
   return CAPABILITY_ORDER.filter(
     (id) => id !== 'mcp' && CAPABILITIES[id].tools.length === 0,

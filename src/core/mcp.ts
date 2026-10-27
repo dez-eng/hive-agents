@@ -141,42 +141,52 @@ export async function connectMcp(
   servers: Record<string, McpServerConfig>,
   opts: ConnectMcpOptions = {},
 ): Promise<McpConnection> {
-  const clients: Client[] = [];
-  const tools: AnyTool[] = [];
-  const status: McpServerStatus[] = [];
   const warn = opts.onWarn ?? ((m: string) => process.stderr.write(`${m}\n`));
 
-  for (const [name, cfg] of Object.entries(servers)) {
-    const client = new Client({ name: 'hive', version: VERSION }, { capabilities: {} });
-    try {
-      const transport = new StdioClientTransport({
-        command: cfg.command,
-        args: cfg.args ?? [],
-        ...(cfg.env ? { env: cfg.env } : {}),
-        ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
-        // server 的 stderr 不直接倒进 REPL；失败原因从异常里拿
-        stderr: 'pipe',
-      });
-      debug('mcp', 'connect', { server: name, command: cfg.command });
-      await client.connect(transport);
-      const listed = await client.listTools();
-      const list = listed.tools ?? [];
-      for (const t of list) tools.push(wrapMcpTool(client, name, t));
-      clients.push(client);
-      status.push({ name, tools: list.length });
-      debug('mcp', 'ready', { server: name, tools: list.length });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      status.push({ name, tools: 0, error: msg });
-      debug('mcp', 'connect-failed', { server: name, error: msg });
-      warn(`[MCP ${name} 连接失败：${msg}]`);
-      try {
-        await client.close();
-      } catch {
-        /* 已经断了 */
-      }
-    }
-  }
+  // v4 性能：各 server **并行**连 —— 冷启动重叠，启动时间取最大值而不是求和。
+  // 失败隔离不变：单个 server 挂了只进 status.error，不影响其它；
+  // 汇总时按配置顺序回填，工具清单顺序与串行版完全一致（前缀缓存不受影响）。
+  const results = await Promise.all(
+    Object.entries(servers).map(
+      async ([name, cfg]): Promise<{ client: Client | null; tools: AnyTool[]; status: McpServerStatus }> => {
+        const client = new Client({ name: 'hive', version: VERSION }, { capabilities: {} });
+        try {
+          const transport = new StdioClientTransport({
+            command: cfg.command,
+            args: cfg.args ?? [],
+            ...(cfg.env ? { env: cfg.env } : {}),
+            ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
+            // server 的 stderr 不直接倒进 REPL；失败原因从异常里拿
+            stderr: 'pipe',
+          });
+          debug('mcp', 'connect', { server: name, command: cfg.command });
+          await client.connect(transport);
+          const listed = await client.listTools();
+          const list = listed.tools ?? [];
+          debug('mcp', 'ready', { server: name, tools: list.length });
+          return {
+            client,
+            tools: list.map((t) => wrapMcpTool(client, name, t)),
+            status: { name, tools: list.length },
+          };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          debug('mcp', 'connect-failed', { server: name, error: msg });
+          warn(`[MCP ${name} 连接失败：${msg}]`);
+          try {
+            await client.close();
+          } catch {
+            /* 已经断了 */
+          }
+          return { client: null, tools: [], status: { name, tools: 0, error: msg } };
+        }
+      },
+    ),
+  );
+
+  const clients = results.flatMap((r) => (r.client ? [r.client] : []));
+  const tools = results.flatMap((r) => r.tools);
+  const status = results.map((r) => r.status);
 
   return {
     servers: status,

@@ -47,7 +47,7 @@ test('工具顺序 = 注册表顺序（顺序即前缀顺序，动它就是作�
 });
 
 test('缓存代价跟着身份走：C 最小，A 最大', () => {
-  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file', 'edit_file', 'bash']);
+  assert.deepEqual(toolNamesFor('C'), ['read_file', 'write_file', 'edit_file', 'bash', 'ask_parent']);
   assert.ok(toolsCharsFor('C') < toolsCharsFor('D'), 'D 多了搜索');
   assert.ok(toolsCharsFor('D') < toolsCharsFor('A'), 'A 还多算数与借调');
   assert.ok(toolsCharsFor('C') > 0);

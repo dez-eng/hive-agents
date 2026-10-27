@@ -273,6 +273,39 @@ export function setMcpAllowServers(servers: string[]): void {
   cached = { ...cur, spec: { ...cur.spec, mcp: { allowServers: [...servers] } } };
 }
 
+/**
+ * v4 M4.2b：把 hive.config.json 里的 `web.allowDomains` 并入当前策略。
+ * 调用方负责「env 优先」—— `HIVE_POLICY_NET` 设了就不要走这里。
+ */
+export function setNetAllowDomains(domains: string[]): void {
+  const cur = loadPolicy();
+  cached = { ...cur, spec: { ...cur.spec, net: { allowDomains: [...domains] } } };
+}
+
+/**
+ * 域名白名单匹配（网关与 web 工具**同源**，别写两份语义）：
+ *
+ * ```
+ * example.com       → 只放行 example.com
+ * *.example.com     → example.com 及其任意子域
+ * *                 → 不限（自担风险）
+ * ```
+ *
+ * 大小写不敏感，末尾点忽略。
+ */
+export function domainAllowed(host: string, allow: string[]): boolean {
+  const h = (host ?? '').trim().toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+  for (const raw of allow) {
+    const d = (raw ?? '').trim().toLowerCase().replace(/\.$/, '');
+    if (!d) continue;
+    if (d === '*') return true;
+    if (d === h) return true;
+    if (d.startsWith('*.') && (h === d.slice(2) || h.endsWith(d.slice(1)))) return true;
+  }
+  return false;
+}
+
 export function currentSpec(): PolicySpec {
   return loadPolicy().spec;
 }
@@ -562,7 +595,7 @@ export function checkAction(a: Action, spec: PolicySpec = currentSpec()): Verdic
 
   if (a.kind === 'net') {
     const host = a.target.trim().toLowerCase();
-    if (!spec.net.allowDomains.some((d) => host === d.toLowerCase())) {
+    if (!domainAllowed(host, spec.net.allowDomains)) {
       return verdict(false, 'denied', `域名 ${host} 不在 net.allowDomains 里`, 'net.allowDomains');
     }
   }

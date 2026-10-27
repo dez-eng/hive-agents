@@ -26,6 +26,8 @@ import { makeTaskId, type HandoffInput } from './core/handoff.js';
 import { continueSubagent, runSubagent } from './core/subagent.js';
 import { TASKS } from './core/tasks.js';
 import { mcpSummary } from './core/mcp.js';
+import { skillSummary } from './core/skill.js';
+import { webSummary } from './core/web.js';
 import {
   declaredOnly,
   toolNamesFor,
@@ -750,7 +752,10 @@ export const COMMANDS: Command[] = [
       ctx.out();
       const only = declaredOnly();
       if (only.length) {
-        ctx.out(dim(`  声明了但还没实现（贡献 0 工具、0 token）：${only.join(' / ')}`));
+        const hints: string[] = [];
+        if (only.includes('skill')) hints.push('skill 需配 skills.dir');
+        if (only.includes('web')) hints.push('web 需配 web.allowDomains');
+        ctx.out(dim(`  当前没有工具的能力：${only.join(' / ')}（${hints.join('；')}）`));
       }
       ctx.out(dim('  装了 write_file ≠ 能写 —— 判定归能力网关，看 /policy。'));
       ctx.out();
@@ -927,6 +932,56 @@ export const COMMANDS: Command[] = [
       }
       ctx.out(dim('  工具名 mcp__<server>__<tool> · 调用需 policy 的 mcp.allowServers 放行'));
       ctx.out(dim('  改配置后重启 hive 生效（清单启动时冻结，避免前缀缓存悄悄作废）\n'));
+    },
+  },
+
+  {
+    name: '/skill',
+    usage: '/skill [list | load <name> | off]',
+    summary: '装载 skill（方法论文本贴用户消息末尾；不进 system 前缀、不进 checkpoint）',
+    async run(ctx, args) {
+      const sub = (args[0] ?? 'list').trim().toLowerCase();
+      const cur = ctx.agent.skillOf(ctx.state.thread);
+
+      if (sub === 'off') {
+        const had = ctx.agent.clearSkill(ctx.state.thread);
+        ctx.out(dim(had ? '[已卸载 skill —— 下一轮起不再贴尾]' : '[本来就没装 skill]'));
+        ctx.out();
+        return;
+      }
+
+      if (sub === 'load') {
+        const name = (args[1] ?? '').trim();
+        if (!name) {
+          ctx.out(red('[要给 skill 名：/skill load <name>（/skill list 看有哪些）]'));
+          ctx.out();
+          return;
+        }
+        const r = ctx.agent.loadSkill(ctx.state.thread, name);
+        ctx.out(r.ok ? green(`[${r.msg}]`) : red(`[${r.msg}]`));
+        ctx.out();
+        return;
+      }
+
+      const s = skillSummary();
+      if (!s) {
+        ctx.out(dim('[没配置 skill —— 在 hive.config.json 里写 skills.dir（默认 .hive/skills）]'));
+        ctx.out(dim('  清单在启动时冻结：运行中改文件不会热更新，重启才生效\n'));
+        return;
+      }
+      ctx.out(
+        bold(
+          `[skill · ${s.dir} · 冻结 ${s.skills.length} 个 · 身份 ${s.agents.join('/') || '（无）'}` +
+            `${cur ? ` · 已装 ${cur.name}` : ''}]`,
+        ),
+      );
+      if (!s.skills.length) ctx.out(dim('  目录里没有可用的 *.md'));
+      for (const k of s.skills) {
+        const mark = cur?.name === k.name ? green('▸') : ' ';
+        ctx.out(`  ${mark} ${k.name.padEnd(18)} ${k.title} ${dim(`${k.bytes} 字节`)}`);
+      }
+      ctx.out(dim('  装载只改发送视图：不进 system 前缀、不进 checkpoint；贴在本轮用户消息末尾'));
+      ctx.out(dim('  清单启动时冻结（改文件要重启）\n'));
     },
   },
 
@@ -1166,6 +1221,22 @@ export const COMMANDS: Command[] = [
         );
       } else {
         ctx.out(dim('  MCP           未配置（hive.config.json 的 mcp.servers）'));
+      }
+      const ss = skillSummary();
+      if (ss) {
+        ctx.out(
+          `  skill         ${ss.dir} · ${ss.skills.length} 个 · 已装 ${ctx.agent.skillOf(ctx.state.thread)?.name ?? '—'} · 身份 ${ss.agents.join('/') || '（无）'}`,
+        );
+      } else {
+        ctx.out(dim('  skill         未配置（hive.config.json 的 skills.dir）'));
+      }
+      const ws = webSummary();
+      if (ws) {
+        ctx.out(
+          `  web           ${ws.allowDomains.join(',') || '（空白名单 → 全拒）'} · 身份 ${ws.agents.join('/') || '（无）'}`,
+        );
+      } else {
+        ctx.out(dim('  web           未配置（hive.config.json 的 web.allowDomains）'));
       }
       ctx.out(`  命令          ${COMMANDS.length} 个`);
       const m = ctx.state.lastTurn;

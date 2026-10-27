@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { parsePriceOverlay, type ModelPrice } from './cost.js';
+import { DEFAULT_SKILL_DIR } from './skill.js';
 
 export interface McpServerConfig {
   command: string;
@@ -27,8 +28,22 @@ export interface McpSettings {
   allowServers: string[];
 }
 
+/** v4 M4.2b：skill 目录与装它的身份（清单启动时冻结） */
+export interface SkillsSettings {
+  dir: string;
+  agents: string[];
+}
+
+/** v4 M4.2b 剩余项：web fetch 的域名白名单与装它的身份 */
+export interface WebSettings {
+  allowDomains: string[];
+  agents: string[];
+}
+
 export interface HiveSettings {
   mcp?: McpSettings;
+  skills?: SkillsSettings;
+  web?: WebSettings;
   price?: Record<string, ModelPrice>;
 }
 
@@ -103,6 +118,43 @@ export function parseSettings(
       warnings.push('mcp.servers 配了，但 mcp.allowServers 为空 —— 工具会装、调用会被 policy 拒');
     }
     out.mcp = { servers, agents, allowServers };
+  }
+
+  if (raw['skills'] !== undefined) {
+    const s = raw['skills'];
+    if (!isPlainObject(s)) return { ok: false, reason: 'skills 必须是对象' };
+    let dir = DEFAULT_SKILL_DIR;
+    if (s['dir'] !== undefined) {
+      if (typeof s['dir'] !== 'string' || !s['dir'].trim()) {
+        return { ok: false, reason: 'skills.dir 必须是非空字符串' };
+      }
+      dir = s['dir'].trim();
+    }
+    let agents = ['A'];
+    if (s['agents'] !== undefined) {
+      if (!isStringArray(s['agents'])) return { ok: false, reason: 'skills.agents 必须是字符串数组' };
+      agents = s['agents'];
+    }
+    out.skills = { dir, agents };
+  }
+
+  if (raw['web'] !== undefined) {
+    const w = raw['web'];
+    if (!isPlainObject(w)) return { ok: false, reason: 'web 必须是对象' };
+    let allowDomains: string[] = [];
+    if (w['allowDomains'] !== undefined) {
+      if (!isStringArray(w['allowDomains'])) return { ok: false, reason: 'web.allowDomains 必须是字符串数组' };
+      allowDomains = (w['allowDomains'] as string[]).map((s) => s.trim()).filter(Boolean);
+    }
+    let agents = ['A'];
+    if (w['agents'] !== undefined) {
+      if (!isStringArray(w['agents'])) return { ok: false, reason: 'web.agents 必须是字符串数组' };
+      agents = w['agents'];
+    }
+    if (!allowDomains.length) {
+      warnings.push('web 配了，但 web.allowDomains 为空 —— 工具会装、调用会被 policy 拒');
+    }
+    out.web = { allowDomains, agents };
   }
 
   if (raw['price'] !== undefined) {
