@@ -25,6 +25,7 @@
   },
   "files": [
     "dist",
+    "privacy-window",
     "README.md",
     "CHANGELOG.md",
     ".env.example",

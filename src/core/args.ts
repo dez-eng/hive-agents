@@ -18,11 +18,14 @@ export interface Parsed {
   as: AgentId | null;
   /** --continue / -c */
   cont: boolean;
+  /** --privacy-child：这个进程跑在隐私窗口里（跳过菜单，账本不记正文） */
+  privacyChild: boolean;
 }
 
 export function parse(argv: string[]): Parsed {
   let as: AgentId | null = null;
   let cont = false;
+  let privacyChild = false;
   const rest: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -38,18 +41,25 @@ export function parse(argv: string[]): Parsed {
       cont = true;
       continue;
     }
+    if (a === '--privacy-child') {
+      privacyChild = true;
+      continue;
+    }
     rest.push(a!);
   }
 
   const first = rest[0];
   const tail = rest.slice(1);
-  if (!first) return { mode: 'repl', rest: [], as, cont };
-  if (first === '--help' || first === '-h' || first === 'help') return { mode: 'help', rest: tail, as, cont };
-  if (first === '--version' || first === '-v' || first === 'version') return { mode: 'version', rest: tail, as, cont };
-  if (first === 'doctor') return { mode: 'doctor', rest: tail, as, cont };
-  if (first === 'init') return { mode: 'init', rest: tail, as, cont };
-  if (first === 'run') return { mode: 'run', rest: tail, as, cont };
-  return { mode: 'run', rest, as, cont };
+  if (!first) return { mode: 'repl', rest: [], as, cont, privacyChild };
+  if (first === '--help' || first === '-h' || first === 'help')
+    return { mode: 'help', rest: tail, as, cont, privacyChild };
+  if (first === '--version' || first === '-v' || first === 'version')
+    return { mode: 'version', rest: tail, as, cont, privacyChild };
+  if (first === 'doctor') return { mode: 'doctor', rest: tail, as, cont, privacyChild };
+  if (first === 'init') return { mode: 'init', rest: tail, as, cont, privacyChild };
+  if (first === 'run') return { mode: 'run', rest: tail, as, cont, privacyChild };
+  if (first === 'privacy') return { mode: 'privacy', rest: tail, as, cont, privacyChild };
+  return { mode: 'run', rest, as, cont, privacyChild };
 }
 
 export type AsVerdict = { ok: true; as: AgentId | null } | { ok: false; msg: string };

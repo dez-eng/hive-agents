@@ -10,6 +10,14 @@ coverage/
 .hive/mcp-memory.json
 # 本地策略（可能含个人白名单；模板由 hive init 生成）
 .hive/policy.json
+# 隐私模式的对话记录与桥接文件（含聊天内容，绝不进版本库）
+.hive/privacy/
+# 隐私窗口的运行日志（窗口侧，产生在 privacy-window/ 下）
+privacy-window/*.log*
+privacy-window/*.status
+# Python 运行产物（pty_bridge 的字节码）
+__pycache__/
+*.pyc
 
 # 凭证
 .env

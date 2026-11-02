@@ -6,7 +6,7 @@
 
 ## 0. 现在的成熟度（2026-10-19 事实）
 
-- `npm test`：**244 个测试全绿**（全部零 API）
+- `npm test`：**259 个测试全绿**（全部零 API）
 - M3.1 真机验收通过：A→C 首跑写入、`/delegate --continue` 续同一子会话改写、
   `/handoffs` 两行同 taskId、`/ledger agents` 按身份汇总。成本约 **$0.0006**
 - 已具备：缓存友好前缀、按身份装配的 8 个工具、能力网关（L1）、
@@ -128,6 +128,30 @@ M4.2b 无剩余项。
 3. **模型批量引导**：`delegate` 描述提示把独立子任务放进同一批。
 4. 244 个零 API 测试全绿（新增 4）。设计见 `docs/V4-PERF-DESIGN.md`。
 
+### 隐私模式：只有物理屏幕能看到对话（2026-10-27 完成）
+
+1. **`hive privacy`**：自建 WinForms 窗口，窗口自己调用
+   `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；终端只显示状态，不显示对话。
+2. **桥接协议**：`.hive/privacy/` 下 `transcript.txt` / `inbox.txt` / `inbox.seq` /
+   `closed.flag` 四个文件，主进程 250ms 轮询。
+3. **边界**：`SetWindowDisplayAffinity` 只能作用于本进程窗口，终端窗口无法从外部保护
+   （实测跨进程调用失败）；不防手机拍摄与采集卡；仅 Windows。
+4. 251 个零 API 测试全绿（新增 7）。设计见 `docs/PRIVACY-DESIGN.md`。
+
+### 隐私模式 v4.6：后台化与稳定性（2026-10-29 完成）
+
+1. **真后台窗口**：`WS_EX_TOOLWINDOW` + `ShowInTaskbar=false`，任务栏与 Alt+Tab 里都没有；
+   窗口进程由 WMI `Win32_Process.Create` 创建，脱离启动器的 Job Object —— 关掉终端后
+   窗口继续跑（`spawn(detached)` 做不到），WMI 起不来才退回 `cmd /c start`。
+2. **启动握手**：启动器轮询 `window.status`（最长 15s），只有 `webview-ready` / `running` /
+   `child-exited` 算起来；`failed` 立即返回原因与日志路径，不再是「命令返回 0、窗口不见」。
+3. **稳定性**：WDA 每 3s 校验并在显示器/系统设置变化后重设；终端异常退出按
+   800ms / 2.5s / 6s 退避重启（2 分钟内最多 3 次，0 退出不重启）；WebView2 渲染进程崩溃
+   后重建控件；关窗先关 stdin 优雅收 ConPTY 再 `taskkill /T /F` 兜底；bridge 每 2s 检查
+   父进程防止变孤儿；启动前预检 `pywinpty`；窗口侧 4MB、bridge 侧 512KB 日志轮转。
+4. **热键**：新增 `Ctrl+Alt+R` 重启终端。
+5. 259 个零 API 测试全绿（新增 8）。设计见 `docs/PRIVACY-DESIGN.md` §0.1 / §0.2。
+
 ### M4.3 可工作：中断、恢复、初始化（2026-10-19 完成）
 
 1. Ctrl+C 只中止当前轮（`AbortController` 传进 `HiveAgent.run`），再按一次退出。
@@ -195,7 +219,7 @@ skill 都是一次全盘缓存作废。skill 文本按需装载，不进 checkpo
 ## 6. 产品级验收标准
 
 1. 干净机器：`npm i -g hive-agents` → `hive init` → `hive doctor` → 真机一轮，全程不需要手写 `.env`
-2. CI 在 Windows/Linux/macOS 全绿（typecheck + 244 测试 + build）
+2. CI 在 Windows/Linux/macOS 全绿（typecheck + 259 测试 + build）
 3. 并行借调：零 API 并发测试 + 一次真机（两个子任务同时跑，账本各自独立）
 4. [x] 至少一个真实 MCP server 能接上并调用（M4.2a：fixture echo / sum）
 5. Ctrl+C 能停当前轮且会话不丢

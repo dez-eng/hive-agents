@@ -34,11 +34,12 @@ printf 'DEEPSEEK_API_KEY=sk-你的key\n' > .env
 ## 用
 
 ```bash
-hive                      # 交互会话（主控 A）
+hive                      # 交互会话（主控 A）—— 启动时先选 1) 正常终端 / 2) 隐私窗口
 hive init                 # 生成 .env.example / .hive/policy.json / hive.config.example.json / .hive/skills/example.md
 hive --as B               # 以侦察身份独立启动；会话挂在 solo#B 上，可以续
 hive --as C --continue    # 续 C 上一次的独立会话
 hive run "3*7 等于几"      # 单轮，适合脚本
+hive privacy              # 直接进隐私窗口（完整终端，防录屏）
 hive doctor               # 环境自检（账本、策略、工具 schema 字符数）
 ```
 
@@ -231,6 +232,46 @@ B/C/D 在子任务里信息不够时，可以调 `ask_parent({question})` 把问
   模块的 `think` 档（B/D 默认 `high`，可按任务降）、`HIVE_TOOL_STEPS`（批数上限）。
 - 设计见 `docs/V4-PERF-DESIGN.md`。
 
+## 隐私模式：只有物理屏幕能看到对话
+
+启动 hive 时先选一次：
+
+```
+  启动方式
+    1) 正常终端
+    2) 隐私窗口 —— 防录屏（OBS / 腾讯会议共享看不到内容），功能与正常终端完全一致
+
+  选择 [1/2]：
+```
+
+选 2 之后，hive 会自建一个窗口并对它调用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`：
+OBS、录屏软件、腾讯会议共享拿到的是一块黑色，而**窗口里跑的是完整的 hive 终端**
+（xterm + ConPTY）—— 斜杠命令、工具输出、流式回复和正常终端一模一样。
+
+- **必须输入 1 或 2**。直接回车不会默认进入任何一边，这是刻意做的。
+- 非交互场景（脚本、管道、`HIVE_NO_ASK=1`）不问，直接走正常终端 —— 自动化不能被一次提问改变。
+- 快捷键：`Ctrl+Alt+P` 显示/隐藏，`Ctrl+Alt+R` 重启终端，`Ctrl+Alt+Q` 退出。
+- 窗口是**后台进程**：不在任务栏、不在 Alt+Tab 里，关掉启动它的终端后仍然在跑，只能靠快捷键召唤。
+- 稳定性：WDA 每 3 秒自检并在显示器/系统设置变化后重设；终端异常退出按 800ms / 2.5s / 6s
+  退避重启（正常退出不重启）；WebView2 渲染进程崩溃后自动重建。
+- 窗口里那一份 hive 带 `--privacy-child`：跳过启动菜单，并且账本正文列写 `[privacy]`。
+
+**其它入口**
+
+- `hive privacy`：跳过菜单直接进隐私窗口。
+- `hive privacy --classic`：回退到旧的自绘聊天窗（只有对话，看不到工具输出），保留给排查用。
+- Windows 双击 `hive.cmd`：和 `hive` 等价，会先确保 `dist/` 已构建。
+
+**边界**
+
+- **终端窗口本身保护不了**：`SetWindowDisplayAffinity` 只能作用于**调用进程自己的窗口**，
+  对 Windows Terminal 的窗口从外部调用会返回失败（实测）。所以 hive 自己开窗口。
+- 隐私模式下对话不会出现在启动它的那个终端里，也不写 `.hive/privacy/transcript.txt`
+  （那是 classic 模式的文件桥接）；账本只记 token 用量。
+- 不防：手机拍摄、HDMI 采集卡。
+- 实现见 `privacy-window/`（`window.ps1` + `pty_bridge.py` + xterm.js）与
+  `docs/PRIVACY-DESIGN.md`。
+
 ## 多 agent：A 主 + B/C/D 副，每个都能单独启动
 
 | 身份 | 角色 | 主模块 | 可借调 | 单独启动 |
@@ -358,12 +399,14 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] v4 M4.3 可工作：Ctrl+C 只停当前轮、错误分类、`hive init`、busy_timeout、`HIVE_DEBUG`
 - [x] v4 M4.2b 扩展：`skill` 装载（`skills.dir` + `load_skill` + `/skill`，贴尾不进前缀/checkpoint）
 - [x] v4 M4.2b 剩余：`web_fetch`（域名白名单 + 私网拦截 + 字节上限，默认不装）
+- [x] 隐私模式：`hive privacy` 自建 WDA 窗口，对话对录屏不可见（Windows）
+- [x] 隐私模式 v4.6：窗口后台化（不进任务栏 / Alt+Tab、关终端仍在）+ 稳定性（WDA 自检、终端自动重启、WebView2 重建、日志轮转）
 - [x] v3 M3.5：B 主动反问 A（`ask_parent` + 暂停-续跑）
 - [x] v4 M4.4 发布工程：三平台 CI、CHANGELOG、CONTRIBUTING
 - [ ] npm 0.1.0 发布（只差 6 位 OTP）
 - [ ] 以后：容器级隔离
 
-设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN、V4-PLAN、V4-M4.2B-DESIGN）。
+设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN、V3-M3.5-DESIGN、V4-PLAN、V4-M4.2B-DESIGN、V4-M4.2B-WEB-DESIGN、V4-PERF-DESIGN、PRIVACY-DESIGN）。
 
 ## License
 

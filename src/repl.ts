@@ -172,6 +172,8 @@ export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Pro
       );
     }
 
+    // 隐私窗口里的 hive：账本只记 token 用量，正文列写占位符
+    const privacyChild = process.env.HIVE_PRIVACY_CHILD === '1';
     ctx.ledger.insert({
       kind: 'turn',
       threadId: ctx.state.thread,
@@ -183,8 +185,8 @@ export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Pro
       reasoning: res.meter.reasoning,
       costUsd: res.meter.cost(),
       userChars: text.length,
-      userHead: text,
-      outHead: answer,
+      userHead: privacyChild ? '[privacy]' : text,
+      outHead: privacyChild ? '' : answer,
       styleOn: ctx.state.tail ? 1 : 0,
       band: res.meter.band,
       agent: currentAgent(ctx.state),

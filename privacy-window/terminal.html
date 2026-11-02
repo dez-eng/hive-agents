@@ -1,0 +1,138 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>reasonix privacy</title>
+<link rel="stylesheet" href="xterm/xterm.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0c; overflow: hidden; }
+  #wrap { display: flex; flex-direction: column; height: 100vh; }
+  #bar {
+    flex: 0 0 auto; height: 24px; line-height: 24px; padding: 0 10px;
+    font: 12px Consolas, monospace; color: #8b949e; background: #161b22;
+    border-bottom: 1px solid #21262d; user-select: none;
+  }
+  #bar .lock { color: #3fb950; }
+  #term { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 6px 4px 0 8px; }
+  .xterm { height: 100%; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar"><span class="lock">&#9679;</span> hive &middot; privacy mode &middot; excluded from capture</div>
+  <div id="term"></div>
+</div>
+<script src="xterm/xterm.js"></script>
+<script>
+(function () {
+  var host = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
+  // Always send JSON strings: the C# side reads them with TryGetWebMessageAsString.
+  var post = function (m) { if (host) { try { host.postMessage(JSON.stringify(m)); } catch (_) { } } };
+
+  function b64utf8(s) {
+    var bytes = new TextEncoder().encode(s);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'Consolas, "Cascadia Mono", monospace',
+    scrollback: 8000,
+    allowProposedApi: true,
+    theme: {
+      background: '#0b0b0c', foreground: '#d6d6d6', cursor: '#4ec9b0',
+      selectionBackground: '#264f78',
+      black: '#1e1e1e', red: '#f14c4c', green: '#4ec9b0', yellow: '#dcdcaa',
+      blue: '#569cd6', magenta: '#c586c0', cyan: '#4dc9b0', white: '#d4d4d4',
+      brightBlack: '#6e7681', brightRed: '#f97583', brightGreen: '#56d364',
+      brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+      brightCyan: '#56d4dd', brightWhite: '#ffffff'
+    }
+  });
+
+  term.open(document.getElementById('term'));
+  term.focus();
+
+  term.onData(function (d) { post({ type: 'input', data: b64utf8(d) }); });
+  term.onBinary(function (d) { post({ type: 'input', data: b64utf8(d) }); });
+
+  var lastCols = 0, lastRows = 0;
+  function reportSize() {
+    if (term.cols === lastCols && term.rows === lastRows) return;
+    lastCols = term.cols; lastRows = term.rows;
+    post({ type: 'resize', cols: term.cols, rows: term.rows });
+  }
+
+  function onHostMessage(e) {
+    var m;
+    try { m = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data; } catch (_) { return; }
+    if (!m || !m.type) return;
+    if (m.type === 'output') {
+      if (m.b64) {
+        try { term.write(b64dec(m.b64)); } catch (_) { }
+      } else if (m.data) {
+        term.write(m.data);
+      }
+    } else if (m.type === 'focus') {
+      term.focus();
+    } else if (m.type === 'status') {
+      var bar = document.getElementById('bar');
+      bar.innerHTML = '<span class="lock">&#9679;</span> ' + m.text;
+    }
+  }
+
+  function b64dec(s) {
+    var bin = atob(s);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+
+  if (host) {
+    host.addEventListener('message', onHostMessage);
+  } else {
+    term.writeln('\x1b[33m[preview]\x1b[0m no WebView2 host - this page is rendered inside reasonix-privacy.ps1');
+    term.writeln('');
+  }
+
+  document.getElementById('term').addEventListener('mouseup', function () { term.focus(); });
+  document.getElementById('term').addEventListener('click', function () { term.focus(); });
+
+  // xterm boots at 80x24; without this the terminal only fills the top-left corner of a
+  // 1240x820 window, and the PTY would run at the wrong size. Measure the cell size from
+  // what xterm itself rendered rather than from a font probe - they differ by a pixel or
+  // two, and that is enough to spawn a scrollbar.
+  function fit() {
+    var el = document.getElementById('term');
+    var screen = el.querySelector('.xterm-screen');
+    if (!screen || !term.cols || !term.rows) return;
+    var cellW = screen.offsetWidth / term.cols;
+    var cellH = screen.offsetHeight / term.rows;
+    if (!cellW || !cellH) return;
+    var cols = Math.floor((el.clientWidth - 14) / cellW);   // #term padding, see CSS
+    var rows = Math.floor((el.clientHeight - 8) / cellH);
+    cols = Math.max(20, cols);
+    rows = Math.max(6, rows);
+    if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+  }
+
+  window.addEventListener('resize', function () {
+    fit();
+    reportSize();
+  });
+
+  term.onResize(function () { reportSize(); });
+
+  // 等一帧让布局稳定，量一次真实单元格尺寸，再报初始尺寸
+  setTimeout(function () {
+    fit();
+    post({ type: 'ready', cols: term.cols, rows: term.rows });
+    reportSize();
+  }, 60);
+})();
+</script>
+</body>
+</html>
