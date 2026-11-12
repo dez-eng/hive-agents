@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [4.7.0] - 2026-11-12
+
 ### Changed
 
 - **隐私窗口界面改成极简对话风（纯视觉，行为零改动）**：`privacy-window/terminal.html`
@@ -22,6 +24,16 @@
   后显示「8s」耗时，拿到中文备注时换成备注、耗时留在右侧。
 
 ### Added
+
+- **配套工具入库（不随 npm 包发布，clone 才有）**：仓库根目录新增
+  `llm-failover/`（断网回退代理：云端优先，连接失败/超时/5xx/429 时自动改发本地
+  Ollama，探测到云端恢复即切回，对客户端透明；双档分流 —— 带 `tools` 的请求走
+  `qwen3:8b` 并关思考，纯问答走 `qwen3:30b-a3b-thinking-2507` 保留思维链）、
+  `ctf-workspace/`（解题铁律 + 本地模型启动脚本）、`start-all.bat`（一键起两端并
+  打印状态）、`agent.py` / `smoke_test.py`（账本与几何律核查、链路冒烟）。
+  入库前把所有 `D:\langchain` / `C:\Users\…` 硬编码路径改成 `%~dp0` 相对自身目录
+  与 `OLLAMA_HOME` / `OLLAMA_MODELS` / `DEEPSEEK_API_KEY` 环境变量，别人 clone
+  下来即可运行；`llm-failover/*.log`、`*.tgz`、`__pycache__/` 已加入 `.gitignore`。
 
 - **v4.7（隐私窗口：左交互 / 右思考 / 底栏指标）**：窗口从「一整块终端」改成三栏 ——
   左侧仍是完整 hive 终端（斜杠命令、工具输出、中断全部原样），右侧新增**思考栏**，

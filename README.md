@@ -15,13 +15,15 @@ TypeScript / langgraph.js。`npm i -g hive-agents` 之后一条 `hive` 就能开
 
 ## 装上
 
-三种都行，都不需要 npm 账号：
+两种都行，都不需要 npm 账号：
 
 ```bash
-npm i -g hive-agents                                       # npm registry
 npm i -g github:dez-eng/hive-agents                        # 直接从 GitHub（会现场编译，约 35s）
-npm i -g https://github.com/dez-eng/hive-agents/releases/download/v0.1.0/hive-agents-0.1.0.tgz
+npm i -g https://github.com/dez-eng/hive-agents/releases/download/v4.7.0/hive-agents-4.7.0.tgz
 ```
+
+> `npm i -g hive-agents`（npm registry）暂时还不行 —— 包还没推到官方源。
+> 用上面两条之一，装出来的是同一份东西。
 
 配 key —— **不配跑不起来**。启动时按优先级找三处 `.env`：
 
@@ -400,6 +402,24 @@ npm run dev         # 直接跑 src/cli.ts
 
 测试全部零 API（假模型 / 临时目录 / 纯函数），所以改代码不必花一分钱。
 
+## 仓库里还有什么
+
+`hive` 本体是 `src/` + `privacy-window/`，也是 npm 包发出去的全部内容
+（见 `package.json` 的 `files`）。仓库根目录另外放了几个**配套件**，它们不随包安装，
+clone 下来才有：
+
+| 路径 | 是什么 | 依赖 |
+|---|---|---|
+| `llm-failover/` | 断网回退代理：云端优先，连不上/超时/5xx/429 时自动改发本地 Ollama，网络恢复后自动切回。对客户端透明，只需把 `base_url` 指向 `http://127.0.0.1:11500` | Python 3 + 本地 `ollama` |
+| `ctf-workspace/` | CTF 解题工作区：解题铁律（禁止一句话结论、必须给可复现过程）+ 本地模型启动脚本 | `ollama` |
+| `start-all.bat` | 一键起 Ollama + 回退代理，并打印两边状态 | 上面两个 |
+| `agent.py` | 学习计划里的账本/几何律核查脚本（`Meter`、`/misscheck` 那一套的 Python 版），用来在真实数据上验证「未命中 = (入 mod 64) + 64k」 | langgraph / langchain-core / langchain-deepseek |
+| `smoke_test.py` | 最小冒烟：确认 langgraph 链路能通 | 同上 |
+
+这几个脚本里的路径都走环境变量或相对自身目录（`OLLAMA_HOME` / `OLLAMA_MODELS` /
+`DEEPSEEK_API_KEY`），没有写死任何机器上的位置。`llm-failover/README.md` 里有完整的
+切换条件、双档模型分流和回滚步骤。
+
 ## 路线图
 
 - [x] v0.1 缓存友好前缀 + 尾部角色槽位 + token 账本 + 几何律检验
@@ -418,7 +438,7 @@ npm run dev         # 直接跑 src/cli.ts
 - [x] 隐私模式 v4.6：窗口后台化（不进任务栏 / Alt+Tab、关终端仍在）+ 稳定性（WDA 自检、终端自动重启、WebView2 重建、日志轮转）
 - [x] v3 M3.5：B 主动反问 A（`ask_parent` + 暂停-续跑）
 - [x] v4 M4.4 发布工程：三平台 CI、CHANGELOG、CONTRIBUTING
-- [ ] npm 0.1.0 发布（只差 6 位 OTP）
+- [ ] 推到 npm registry（本地已有可用包，等有 OTP 时补）
 - [ ] 以后：容器级隔离
 
 设计与实测记录都在 `docs/` 里（V2-PLAN、V3-PLAN、V3-M2-DESIGN、V3-M2.5-DESIGN、V3-M2.6-DESIGN、V3-M3-DESIGN、V3-M3.5-DESIGN、V4-PLAN、V4-M4.2B-DESIGN、V4-M4.2B-WEB-DESIGN、V4-PERF-DESIGN、PRIVACY-DESIGN）。

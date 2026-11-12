@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { bandNow, type Band } from './cost.js';
 
 export const APP_NAME = 'hive';
-export const VERSION = '0.1.0';
+export const VERSION = '4.7.0';
 
 /** 包根目录（src/core 或 dist/core 向上两级）—— 全局安装时也能找到自带的 .env */
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');

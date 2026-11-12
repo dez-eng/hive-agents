@@ -19,6 +19,12 @@ privacy-window/*.status
 __pycache__/
 *.pyc
 
+# llm-failover 的运行日志（每次启动都追加，含请求时序，不进版本库）
+llm-failover/*.log
+
+# 本地打包产物（靠 npm pack 重新生成）
+*.tgz
+
 # 凭证
 .env
 .env.local
