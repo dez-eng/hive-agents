@@ -30,6 +30,12 @@ jobs:
       # 失败时能看清是哪一步
       - run: npm ci --ignore-scripts
 
+      # 但 better-sqlite3 是原生模块，--ignore-scripts 连它的 install 一起跳过了：
+      # 缺 better_sqlite3.node 时，所有走 sqlite checkpoint 的测试都会
+      # 「Could not locate the bindings file」而失败。单独补这一步（prebuild-install
+      # 优先拿预编译二进制，拿不到再 node-gyp 编译）。
+      - run: npm rebuild better-sqlite3
+
       - run: npm run typecheck
 
       - run: npm test
