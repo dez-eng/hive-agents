@@ -24,7 +24,10 @@ import { SessionTally } from './core/meter.js';
 import { AGENTS, DEFAULT_MODULE, getAgent, getModule, type AgentId } from './core/modules.js';
 import { currentAgent, currentModuleId, newReplState, newReplStateFor, type ReplState } from './core/session.js';
 import { findCommand, footerInput, knownCommandNames, type Ctx } from './commands.js';
-import { bold, cyan, dim, fmtUsd, gray, red } from './ui/format.js';
+import { gistFor } from './core/gist.js';
+import { knownBalance, knownBalanceAt, knownBalanceCurrency, refreshBalance } from './core/balance.js';
+import { emitUi, uiSink } from './core/uievents.js';
+import { bold, cyan, dim, fmtUsd, gray, red, stripAnsi } from './ui/format.js';
 import { renderFooter } from './ui/footer.js';
 
 export interface ContextOptions {
@@ -57,7 +60,12 @@ export function buildContext(opts: ContextOptions = {}): BuiltContext {
     ledger,
     session,
     state,
-    out: (s = '') => process.stdout.write(`${s}\n`),
+    out: (s = '') => {
+      process.stdout.write(`${s}\n`);
+      // 对话流视图里，命令输出（/cost 的表格、报错、提示）也要看得见 ——
+      // 同一份文本剥掉 ANSI 再发一份，前端当系统消息渲染。
+      if (s && uiSink()) emitUi({ t: 'out', text: stripAnsi(s) });
+    },
   };
   if (!opened) {
     ctx.out(red(`[账本打不开 ${ledgerPath()} —— 本次不落盘，对话照常]`));
@@ -68,6 +76,35 @@ export function buildContext(opts: ContextOptions = {}): BuiltContext {
 export function printFooter(ctx: Ctx): void {
   if (!ctx.state.footer) return;
   process.stdout.write(`${renderFooter(footerInput(ctx))}\n`);
+}
+
+/**
+ * 底部指标栏的数据 —— 和终端那行 footer 同源（footerInput），
+ * 但窗口里要能**分列显示**，所以给结构化字段而不是拼好的字符串。
+ * 余额由 balance.ts 异步查（带缓存），这里只取当前已知值。
+ */
+function emitStats(ctx: Ctx): void {
+  if (!uiSink()) return;
+  const f = footerInput(ctx);
+  const m = f.lastTurn;
+  emitUi({
+    t: 'stats',
+    stats: {
+      model: f.model,
+      band: f.band,
+      cost: m ? m.cost() : 0,
+      reasonPct: m && m.cost() ? Math.round((m.reasonCost() / m.cost()) * 100) : 0,
+      ctxTok: m ? m.inTok : 0,
+      cacheHit: m ? m.cacheHit : 0,
+      hitRate: m ? m.hitRate() : 0,
+      sessionCost: f.session.costUsd,
+      turns: f.session.turns,
+      avgCost: f.session.avgCost,
+      balance: knownBalance(),
+      balanceCurrency: knownBalanceCurrency(),
+      balanceAt: knownBalanceAt(),
+    },
+  });
 }
 
 let delegateSeq = 0;
@@ -127,7 +164,13 @@ function banner(ctx: Ctx): void {
 export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Promise<void> {
   // 当前角色 = 栈顶模块。借调中就是被借调的那个 agent
   const mod = getModule(currentModuleId(ctx.state)) ?? getModule('assistant')!;
+  emitUi({ t: 'turn', text });
   process.stdout.write(`\n${bold('助手')} ${dim('>')} `);
+
+  // 右栏的思考正文在这里攒着：一段思考结束时拿去让模型写一句中文备注。
+  // 攒的是全文而不是最后一片 —— 备注要的是这段思考的结论，不是结尾半句话。
+  let thinkBuf = '';
+  let turnOk = true;
 
   let answer = '';
   try {
@@ -145,6 +188,23 @@ export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Pro
         budgetTokens: turnBudget(),
         // v4 M4.3：Ctrl+C 中止这一轮
         ...(signal ? { signal } : {}),
+        hooks: {
+          onThink: (piece) => {
+            thinkBuf += piece;
+          },
+          onThinkEnd: () => {
+            const body = thinkBuf;
+            thinkBuf = '';
+            if (!body) return;
+            // 没有事件通道（正常终端）就没有右栏可填 —— 别为一个没人看的备注花钱。
+            // `hive --as B` 这类 high 档身份在终端里跑一轮会有多段思考，每段都会触发这里。
+            if (!uiSink()) return;
+            // 备注是异步的：它回来晚一点右栏就补一行，绝不阻塞对话流
+            void gistFor({ thinking: body, task: text }).then((g) =>
+              emitUi({ t: 'gist', gist: g.gist, source: g.source }),
+            );
+          },
+        },
       },
       (piece) => {
         process.stdout.write(piece);
@@ -172,8 +232,9 @@ export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Pro
       );
     }
 
-    // 隐私窗口里的 hive：账本只记 token 用量，正文列写占位符
-    const privacyChild = process.env.HIVE_PRIVACY_CHILD === '1';
+    // 隐私窗口里的 hive：账本只记 token 用量，正文列写占位符。
+    // 普通窗口（不防录屏）不脱敏 —— 那是隐私模式独有的要求。
+    const redact = process.env.HIVE_PRIVACY_REDACT === '1';
     ctx.ledger.insert({
       kind: 'turn',
       threadId: ctx.state.thread,
@@ -185,25 +246,40 @@ export async function runTurn(ctx: Ctx, text: string, signal?: AbortSignal): Pro
       reasoning: res.meter.reasoning,
       costUsd: res.meter.cost(),
       userChars: text.length,
-      userHead: privacyChild ? '[privacy]' : text,
-      outHead: privacyChild ? '' : answer,
+      userHead: redact ? '[privacy]' : text,
+      outHead: redact ? '' : answer,
       styleOn: ctx.state.tail ? 1 : 0,
       band: res.meter.band,
       agent: currentAgent(ctx.state),
     });
   } catch (e) {
+    turnOk = false;
     process.stdout.write('\n');
     const c = classifyError(e);
     ctx.out(red(`  ── [${c.title}] ${c.message}`));
     if (c.hint) ctx.out(dim(`     ${c.hint}`));
+    emitUi({ t: 'note', kind: 'error', text: `${c.title}：${c.message}` });
   }
 
+  // 整段回答交给前端重排 markdown：增量拼出来的列表/代码块在流式时会抖
+  if (answer) emitUi({ t: 'say_done', text: answer });
   printFooter(ctx);
+  emitStats(ctx);
+  emitUi({ t: 'turn_end', ok: turnOk });
   process.stdout.write('\n');
 }
 
 export async function startRepl(opts: ContextOptions = {}): Promise<void> {
   const { ctx, ledger } = buildContext(opts);
+  // 窗口右栏的开场：模型 / 线程 / 身份，前端据此清空旧的思考流
+  emitUi({
+    t: 'session',
+    model: ctx.agent.modelId,
+    thread: ctx.state.thread,
+    module: currentModuleId(ctx.state),
+  });
+  // 余额先查一次（不 await 也不会阻塞开场）—— 指标栏第一轮就有数
+  if (uiSink()) void refreshBalance(true);
   banner(ctx);
 
   const rl: Interface = createInterface({

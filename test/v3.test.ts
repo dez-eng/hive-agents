@@ -48,16 +48,28 @@ test('newReplStateFor：栈底直接是该 agent 的主模块', () => {
 });
 
 test('parse：默认 repl；--as / --continue 被摘出来，不进 rest', () => {
-  assert.deepEqual(parse([]), { mode: 'repl', rest: [], as: null, cont: false, privacyChild: false });
+  assert.deepEqual(parse([]), {
+    mode: 'repl',
+    rest: [],
+    as: null,
+    cont: false,
+    privacyChild: false,
+    uiEvents: null,
+    redact: false,
+  });
 
-  // 隐私窗口里跑的那一份：跳菜单 + 账本脱敏
+  // 窗口里跑的那一份：跳菜单 + 发事件（脱敏是另一个开关，见 --redact）
   assert.deepEqual(parse(['--privacy-child']), {
     mode: 'repl',
     rest: [],
     as: null,
     cont: false,
     privacyChild: true,
+    uiEvents: null,
+    redact: false,
   });
+  // 隐私窗口额外带 --redact：账本不记正文
+  assert.equal(parse(['--privacy-child', '--redact']).redact, true);
   const pc = parse(['dist/cli.js', '--privacy-child', '--as', 'B']);
   assert.equal(pc.privacyChild, true);
   assert.equal(pc.as, 'B');

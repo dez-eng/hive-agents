@@ -6,7 +6,55 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **隐私窗口界面改成极简对话风（纯视觉，行为零改动）**：`privacy-window/terminal.html`
+  整份重写，从「GitHub 深色 + 蓝/绿/紫黄四种强调色」换成暖中性底 + **单一陶土橙**强调，
+  居中 760px 窄栏、serif 标题、胶囊化的思考/工具条、卡片式输入框、底部指标栏降到 11.5px
+  的弱重量。一屏只让一个颜色说话，其余全退后 —— 原来四色并列时视线是散的。
+  内置明暗两套主题（`data-theme`，默认暖暗，按钮切换，选择存 `localStorage`），
+  切主题时页面多发一条 `{type:'theme',dark:0|1}`，`window.ps1` 用
+  `DwmSetWindowAttribute`（20 / 19 兼容 Win10，35/36/34 给 Win11）把**系统标题栏**
+  一起换色，否则暗色正文顶着一条白标题栏像两个程序拼的。
+  `window.ps1` 里 4 处硬编码的冷黑 `#0b0b0c`（窗体背景、WebView2 默认背景 ×2、
+  启动失败提示）统一改成 `#1f1e1d`，加载与崩溃重建时不再闪一块不匹配的黑。
+  消息契约、PTY 尺寸（120×40）、热键、WDA、事件流全部原样；思考条只在 `think_end`
+  后显示「8s」耗时，拿到中文备注时换成备注、耗时留在右侧。
+
 ### Added
+
+- **v4.7（隐私窗口：左交互 / 右思考 / 底栏指标）**：窗口从「一整块终端」改成三栏 ——
+  左侧仍是完整 hive 终端（斜杠命令、工具输出、中断全部原样），右侧新增**思考栏**，
+  底部一行指标栏。数据不走终端流，而是 node 侧另写一份 JSONL 事件
+  （`.hive/privacy/ui-events.jsonl`，`--ui-events=<path>`），由 `window.ps1` 每 150ms
+  读增量、`PostWebMessage` 推给前端 —— 解析 ANSI 猜样式那套太脆，一换配色就崩。
+  右栏每段思考结束再调一次 flash 生成**一句中文备注**（英文思考人看不懂；约 1s、
+  成本可忽略，`HIVE_UI_GIST=0` 可关，失败退规则版），并可折叠查看思考原文。
+  思考档：隐私窗口里把 `low` 身份提升为 `high`（`effectiveThink`）—— 实测主控默认
+  关思考，不提升则右栏全空；正常终端保持原档，思考 token 那 30% 不该悄悄涨价。
+  底栏含模型 / 峰谷 / 本轮花费与思考占比 / 上下文 / 本次缓存命中数与命中率 /
+  会话累计与平均每轮 / 账户余额（`/user/balance`，60s 缓存）。
+  踩到的坑记在这里：**LangGraph 的 `streamMode:'messages'` 会把
+  `additional_kwargs.reasoning_content` 冲成 null**（裸 `ChatDeepSeek.stream` 里
+  明明是逐块中文增量），所以思考正文只能从 `handleLLMEnd` 的合并消息里取；
+  另外 `baseUrl()` 未设置时返回的是空串而非 undefined，`??` 兜不住，拼出
+  `/user/balance` 直接 ERR_INVALID_URL。
+
+- **v4.7 续（普通模式也用同一套窗口界面）**：启动菜单从两项变三项 ——
+  1) 窗口界面（对话流 + 思考 + 指标栏，**不防录屏**） 2) 隐私窗口（同上界面 + WDA
+  防录屏 + 账本脱敏） 3) 纯终端（脚本 / SSH / 窗口起不来时）。`hive window` 与
+  `hive privacy` 可直达，不必过菜单。
+  「在窗口里跑」与「隐私脱敏」拆成两个独立开关：`--privacy-child` 只表示「我是窗口里
+  那一份」（跳菜单、发事件、开思考），脱敏另走 `--redact` —— 否则普通窗口里
+  `/cost`、`/sessions` 全是 `[privacy]`，正常用反而更难受。
+  `noProtect` 走 `window.json` 而不是环境变量：窗口进程由 WMI `Win32_Process.Create`
+  创建，**不继承调用者的环境**，环境变量传不进去（实测踩过）。
+  普通窗口起不来（非 Windows / `privacy-window/` 不完整 / 启动失败）自动回退纯终端
+  并打印原因；隐私窗口仍然报错 —— 它静默降级成一个会被录进去的终端才是真问题。
+  顺带修掉一处空花销：没有事件通道时不再调用备注生成（原先 `hive --as B` 这类
+  high 档身份在终端里每段思考都会白调一次 flash，结果没人看）。
+  实测两种窗口的差别：`hive window` → `excluded=False affinity=0x00`（无 `--redact`）；
+  `hive privacy` → `excluded=True affinity=0x11`（带 `--redact`）。零 API 测试 284。
 
 - **v4.6（隐私模式的后台化与稳定性）**：窗口改成**后台进程** ——
   `WS_EX_TOOLWINDOW` + `ShowInTaskbar=false`，任务栏和 Alt+Tab 里都没有它，只靠
@@ -60,6 +108,22 @@
   终端只显示状态。窗口与主进程用 `.hive/privacy/` 下的 transcript/inbox/seq/closed
   四个文件桥接。终端窗口本身无法从外部保护（API 只允许本进程窗口），这是自建窗口的
   原因。零 API 测试 244 → 251。设计见 `docs/PRIVACY-DESIGN.md`。
+
+### Fixed
+
+- **v4.7（bash 在 Windows 上真正可用）**：`npm` / `npx` / `yarn` / `pnpm` 在 Windows 上
+  实际是 `.cmd`，旧实现 `spawn(bin)` 不按 `PATHEXT` 解析，直接 `ENOENT`。现在先解析真实
+  文件，`.cmd/.bat` 只经由 `cmd.exe /d /s /v:off /c` 启动，参数逐条加引号，拒绝 cmd 无法
+  安全转义的 `"` / `%` / 换行；白名单仍按原始命令名判定（放行 `npm` 即可）。同时补全
+  子进程的 Windows 环境（`APPDATA` / `LOCALAPPDATA` / `ProgramFiles` 等）、stdin 不再挂起、
+  超时用 `taskkill /T /F` 收整棵进程树、输出上限恢复为 stdout+stderr 合计 4000。
+  零 API 测试 259 → 265（新增 6）。管道 / 重定向 / 通配符仍不支持。
+
+- **v4.7（从任意目录启动）**：`.env` 按「cwd → `~/.hive/.env` → 包根」三层回退，
+  全局 `hive` 在用户目录里也能读到安装目录的 key；没有 key 时列出查过的路径并以
+  退出码 2 退出，不再在 `buildContext` 里抛 `Deepseek API key not found` 的 stack。
+  `--privacy-child` 现在真正跳过启动菜单（之前只设了环境变量，窗口里会再问一次），
+  隐私窗口里的终端不会再启动即退出。零 API 测试 265 → 267。
 
 ### 计划
 

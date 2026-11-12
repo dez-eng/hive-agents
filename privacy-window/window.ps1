@@ -29,6 +29,7 @@ param(
   [string]$WorkDir = "",
   [string]$Title = "hive - privacy mode",
   [string]$StatusPath = "",
+  [string]$EventsPath = "",
   [int]$Cols = 120,
   [int]$Rows = 34
 )
@@ -56,6 +57,10 @@ if (-not [string]::IsNullOrWhiteSpace($Spec)) {
     if ($specJson.workDir) { $WorkDir = [string]$specJson.workDir }
     if ($specJson.title) { $Title = [string]$specJson.title }
     if ($specJson.statusPath) { $StatusPath = [string]$specJson.statusPath }
+    if ($specJson.eventsPath) { $EventsPath = [string]$specJson.eventsPath }
+    # 普通「窗口界面」：同一套窗口模板，但不设 WDA（不防录屏）。
+    # 设成环境变量而不是构造参数 —— C# 的 _noProtect 本来就读它，同进程可见。
+    if ($specJson.noProtect -eq $true) { $env:HIVE_PRIVACY_NO_PROTECT = "1" }
   } catch {
     Write-Host ("[privacy] 读不了 spec: " + $_.Exception.Message)
     exit 1
@@ -315,6 +320,10 @@ public class PrivacyTermForm : Form
     [DllImport("user32.dll", SetLastError = true)] static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint dwAffinity);
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    // 系统标题栏跟着页面主题走：白标题栏配暖色正文非常刺眼。
+    // 属性号 20 是 Win10 20H1+ 的 DWMWA_USE_IMMERSIVE_DARK_MODE，更早的版本用 19；
+    // 35/36/34 是 Win11 的标题栏背景/文字/边框色（COLORREF，0x00BBGGRR）。
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
     const int WM_HOTKEY = 0x0312;
@@ -323,12 +332,15 @@ public class PrivacyTermForm : Form
     const int HK_TOGGLE = 1, HK_QUIT = 2, HK_RESTART = 3;
     const int WS_EX_TOOLWINDOW = 0x00000080, WS_EX_APPWINDOW = 0x00040000;
 
-    readonly string _python, _bridgeScript, _exe, _args, _workDir, _assetDir, _udf, _statusPath, _logPath, _title;
+    readonly string _python, _bridgeScript, _exe, _args, _workDir, _assetDir, _udf, _statusPath, _logPath, _title, _eventsPath;
     readonly bool _noProtect;
 
     WebView2 _wv;
     PtyBridge _bridge;
     System.Windows.Forms.Timer _guard;
+    System.Windows.Forms.Timer _evPoll;
+    long _evOffset;
+    string _evCarry = "";
     bool _excluded, _wasExcluded, _closing, _recovering, _childGone;
     uint _affinity;
     int _lastCols = 120, _lastRows = 34;
@@ -337,10 +349,12 @@ public class PrivacyTermForm : Form
     string _state = "starting";
 
     public PrivacyTermForm(string python, string bridge, string exe, string args, string workDir,
-                           string assetDir, string udf, string statusPath, string logPath, string title)
+                           string assetDir, string udf, string statusPath, string logPath, string title,
+                           string eventsPath)
     {
         _python = python; _bridgeScript = bridge; _exe = exe; _args = args; _workDir = workDir;
         _assetDir = assetDir; _udf = udf; _statusPath = statusPath; _logPath = logPath; _title = title;
+        _eventsPath = eventsPath ?? "";
         // Debug only: HIVE_PRIVACY_NO_PROTECT=1（兼容旧的 REASONIX_PRIVACY_NO_PROTECT）
         // 启动时不设 WDA，方便截图排查渲染问题。
         _noProtect = Environment.GetEnvironmentVariable("HIVE_PRIVACY_NO_PROTECT") == "1"
@@ -357,13 +371,16 @@ public class PrivacyTermForm : Form
         // 没有任务栏按钮 / Alt+Tab 条目，靠 Ctrl+Alt+P 召唤。
         ShowInTaskbar = false;
         var wa = Screen.PrimaryScreen.WorkingArea;
-        Size = new Size(Math.Min(1240, wa.Width - 80), Math.Min(820, wa.Height - 80));
-        MinimumSize = new Size(640, 380);
-        BackColor = Color.FromArgb(11, 11, 12);
+        // 左右分栏后左边只有 58% —— 1240 宽时终端掉到 89 列，太窄。
+        // 1440 给终端约 105 列，右侧思考栏也有 ~570px。
+        Size = new Size(Math.Min(1440, wa.Width - 80), Math.Min(880, wa.Height - 80));
+        MinimumSize = new Size(760, 420);
+        // 与页面 --bg 一致（暖暗 #1f1e1d），否则加载瞬间会闪一块冷黑。
+        BackColor = Color.FromArgb(31, 30, 29);
 
         _wv = new WebView2();
         _wv.Dock = DockStyle.Fill;
-        _wv.DefaultBackgroundColor = Color.FromArgb(11, 11, 12);
+        _wv.DefaultBackgroundColor = Color.FromArgb(31, 30, 29);
         Controls.Add(_wv);
 
         Shown += async (s, e) => { ApplyAffinity(true); await InitWebViewAsync(); };
@@ -391,6 +408,7 @@ public class PrivacyTermForm : Form
         RegisterHotKey(Handle, HK_TOGGLE, 0x0002 | 0x0001, (uint)Keys.P);
         RegisterHotKey(Handle, HK_QUIT, 0x0002 | 0x0001, (uint)Keys.Q);
         RegisterHotKey(Handle, HK_RESTART, 0x0002 | 0x0001, (uint)Keys.R);
+        ApplyFrameTheme(true);   // 页面默认暖暗；前端切主题时会再发一条 theme
         Log("window: handle=0x" + Handle.ToInt64().ToString("X") + " affinity=0x" + _affinity.ToString("X2") +
             " excluded=" + _excluded + " taskbar=False noProtect=" + _noProtect);
         WriteStatus("starting");
@@ -401,6 +419,81 @@ public class PrivacyTermForm : Form
         _guard.Interval = 3000;
         _guard.Tick += (s, ev) => GuardTick();
         _guard.Start();
+
+        // 右栏的事件流：hive 把结构化事件写成 JSONL，这里按增量读出来推给页面。
+        // 为什么不是文件监听（FileSystemWatcher）：Windows 上它对「同一个句柄追加写」
+        // 的事件偶尔会合并/丢失，而 150ms 轮询的开销在 SSD 上可以忽略（一次 stat + 读增量）。
+        if (!string.IsNullOrEmpty(_eventsPath))
+        {
+            _evPoll = new System.Windows.Forms.Timer();
+            _evPoll.Interval = 150;
+            _evPoll.Tick += (s, ev) => PollUiEvents();
+            _evPoll.Start();
+            Log("ui-events: polling " + _eventsPath);
+        }
+    }
+
+    /// <summary>
+    /// 读 events.jsonl 的新增部分，逐行作为 {type:"ui", line:"<json>"} 推给前端。
+    /// 只记 offset，不缓存整个文件 —— 事件里含思考正文，可能几十 KB，没必要留在内存。
+    /// </summary>
+    void PollUiEvents()
+    {
+        try
+        {
+            if (!System.IO.File.Exists(_eventsPath)) return;
+            var fi = new System.IO.FileInfo(_eventsPath);
+            if (fi.Length < _evOffset) { _evOffset = 0; _evCarry = ""; }   // 文件被清空（新一轮会话）
+            if (fi.Length == _evOffset) return;
+
+            string chunk;
+            using (var fs = new System.IO.FileStream(_eventsPath, System.IO.FileMode.Open,
+                                                      System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+            {
+                if (fi.Length > _evOffset) fs.Seek(_evOffset, System.IO.SeekOrigin.Begin);
+                var buf = new byte[fi.Length - _evOffset];
+                int read = fs.Read(buf, 0, buf.Length);
+                _evOffset += read;
+                chunk = System.Text.Encoding.UTF8.GetString(buf, 0, read);
+            }
+
+            string all = _evCarry + chunk;
+            int cut;
+            while ((cut = all.IndexOf('\n')) >= 0)
+            {
+                string line = all.Substring(0, cut).Trim();
+                all = all.Substring(cut + 1);
+                if (line.Length > 0) PostJson("{\"type\":\"ui\",\"line\":\"" + EscapeJson(line) + "\"}");
+            }
+            // 最后一行可能是半条（写入还没结束）：留到下次
+            _evCarry = all;
+        }
+        catch (Exception ex)
+        {
+            // 事件通道坏了不影响终端 —— 只在日志里记一次
+            Log("ui-events: poll failed " + ex.Message);
+        }
+    }
+
+    static string EscapeJson(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length + 16);
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        return sb.ToString();
     }
 
     protected override void WndProc(ref Message m)
@@ -558,7 +651,7 @@ public class PrivacyTermForm : Form
             try { Controls.Remove(_wv); _wv.Dispose(); } catch { }
             _wv = new WebView2();
             _wv.Dock = DockStyle.Fill;
-            _wv.DefaultBackgroundColor = Color.FromArgb(11, 11, 12);
+            _wv.DefaultBackgroundColor = Color.FromArgb(31, 30, 29);
             Controls.Add(_wv);
             _wv.BringToFront();
             await InitWebViewAsync();
@@ -597,8 +690,8 @@ public class PrivacyTermForm : Form
             var box = new Label();
             box.Dock = DockStyle.Fill;
             box.Padding = new Padding(16);
-            box.BackColor = Color.FromArgb(11, 11, 12);
-            box.ForeColor = Color.FromArgb(240, 130, 130);
+            box.BackColor = Color.FromArgb(31, 30, 29);
+            box.ForeColor = Color.FromArgb(226, 122, 106);
             box.Font = new Font("Consolas", 10f);
             box.Text = what + "\r\n\r\n" + (ex != null ? ex.Message : "") + "\r\n\r\n完整日志: " + _logPath;
             Controls.Add(box);
@@ -647,6 +740,31 @@ public class PrivacyTermForm : Form
             if (!md.Success) return;
             _bridge.Send("{\"t\":\"in\",\"d\":\"" + md.Groups[1].Value + "\"}");
         }
+
+        if (type == "theme") ApplyFrameTheme(ParseInt(json, "dark", 1) == 1);
+    }
+
+    /// <summary>
+    /// 让系统标题栏跟上页面主题。页面切到浅色时白标题栏没问题，但暗色正文配
+    /// 白色标题栏会像两个不同程序拼起来的；Win10/11 分别认 20 和 35/36/34。
+    /// 参数全是 COLORREF（0x00BBGGRR），写错顺序只会显示成怪色，不会崩。
+    /// </summary>
+    void ApplyFrameTheme(bool dark)
+    {
+        try
+        {
+            int mode = dark ? 1 : 0;
+            if (DwmSetWindowAttribute(Handle, 20, ref mode, sizeof(int)) != 0)
+                DwmSetWindowAttribute(Handle, 19, ref mode, sizeof(int));   // Win10 20H1 之前
+
+            int bg = dark ? 0x1D1E1F : 0xF1F6F7;   // #1f1e1d / #f7f6f1
+            int fg = dark ? 0xE9EFF2 : 0x26292B;   // #f2efe9 / #2b2926
+            int bd = dark ? 0x373A3B : 0xD3DEE2;   // #3b3a37 / #e2ded3
+            DwmSetWindowAttribute(Handle, 35, ref bg, sizeof(int));
+            DwmSetWindowAttribute(Handle, 36, ref fg, sizeof(int));
+            DwmSetWindowAttribute(Handle, 34, ref bd, sizeof(int));
+        }
+        catch { }
     }
 
     static int ParseInt(string json, string key, int def)
@@ -883,7 +1001,7 @@ if (-not $owned) {
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 try {
-  $form = New-Object PrivacyTermForm($pythonExe, $bridgeScript, $Command, $CommandArgs.Trim(), $WorkDir, $assetDir, $udfRoot, $StatusPath, $logPath, $Title)
+  $form = New-Object PrivacyTermForm($pythonExe, $bridgeScript, $Command, $CommandArgs.Trim(), $WorkDir, $assetDir, $udfRoot, $StatusPath, $logPath, $Title, $EventsPath)
   Write-LaunchLog "form: constructed, entering message loop"
   [System.Windows.Forms.Application]::Run($form)
   Write-LaunchLog "form: message loop exited"

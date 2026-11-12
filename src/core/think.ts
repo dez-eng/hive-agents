@@ -71,7 +71,15 @@ export const THINK_CANDIDATES: ThinkCandidate[] = [
 export const THINK_KWARGS: Record<ThinkBudget, Record<string, unknown>> = {
   off: { thinking: { type: 'disabled' } },
   low: { thinking: { type: 'disabled' } },
-  high: {},
+  // high 为什么要显式 enabled：**不是**为了打开思考（不传它也在思考），
+  // 而是为了把**思考正文**拿回来。
+  // 2026-11-02 实测（deepseek-flash，同一个问题）：
+  //   · 不传 thinking            → reasoning_tokens=139，additional_kwargs.reasoning_content 恒为 null
+  //   · thinking.type=enabled    → reasoning_tokens=123，reasoning_content 372 字（英文正文）
+  //   · deepseek-reasoner 默认   → reasoning_content 952 字
+  // 老注释里「默认已思考全开，不必显式 enabled」在 token 计数上成立、在正文上是错的 ——
+  // 隐私窗口右侧的思考栏没有正文就只能是空的，所以这里必须显式。
+  high: { thinking: { type: 'enabled' } },
 };
 
 /** 一次探针的计量 */

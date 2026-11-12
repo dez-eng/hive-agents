@@ -29,6 +29,8 @@ export interface PrivacyPaths {
   closed: string;
   script: string;
   status: string;
+  /** 窗口右栏的 JSONL 事件流（--ui-events 指到这里） */
+  events: string;
 }
 
 export function privacyPaths(cwd = process.cwd()): PrivacyPaths {
@@ -41,6 +43,7 @@ export function privacyPaths(cwd = process.cwd()): PrivacyPaths {
     closed: join(dir, 'closed.flag'),
     script: join(dir, 'privacy-bridge.ps1'),
     status: join(dir, 'window.status'),
+    events: join(dir, 'ui-events.jsonl'),
   };
 }
 
@@ -118,6 +121,11 @@ export interface TuiWindowOptions {
   args?: string[];
   workDir?: string;
   title?: string;
+  /**
+   * 不设 WDA（防录屏）。普通「窗口界面」用 true —— 同一套界面，但不做防录屏。
+   * 走 spec 文件而不是环境变量：窗口进程由 WMI 创建，**不继承调用者的环境变量**。
+   */
+  noProtect?: boolean;
 }
 
 export interface TuiWindowResult {
@@ -262,6 +270,11 @@ export async function launchTuiWindow(p: PrivacyPaths, opts: TuiWindowOptions): 
         workDir: opts.workDir ?? process.cwd(),
         title: opts.title ?? 'hive - privacy mode',
         statusPath: p.status,
+        // 右栏的数据源。前端不直接读文件（WebView2 里没有文件权限），
+        // 由 C# 侧轮询增量后 PostWebMessage 推过去。
+        eventsPath: p.events,
+        // 普通窗口不设 WDA：同一套界面，但不做防录屏
+        noProtect: opts.noProtect ?? false,
       },
       null,
       2,
@@ -385,9 +398,13 @@ function killTree(pid: number | undefined): void {
 }
 
 /** 窗口里那一份 hive 的启动参数：跳过菜单 + 账本脱敏 */
-export function tuiChildArgs(entry: string, as: string | null): string[] {
+export function tuiChildArgs(entry: string, as: string | null, events?: string, redact = false): string[] {
   const args = [entry, '--privacy-child'];
   if (as) args.push('--as', as);
+  // 右栏的事件通道：一个完整 argv 元素，路径里有空格也不会被拆开
+  if (events) args.push(`--ui-events=${events}`);
+  // 只有隐私窗口才记账本脱敏；普通窗口照常记正文
+  if (redact) args.push('--redact');
   return args;
 }
 

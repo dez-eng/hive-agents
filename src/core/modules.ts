@@ -171,6 +171,24 @@ export function getModule(id: string): AgentModule | undefined {
   return MODULES[id];
 }
 
+/**
+ * 实际生效的思考档 —— 隐私窗口里给「关思考」的身份打开。
+ *
+ * 为什么只对窗口生效：用户在隐私窗口里就是要**看着它想什么**（右侧思考栏），
+ * 而思考 token 约占总输出的 30%。这个涨价不该悄悄发生在正常终端里。
+ *
+ * `off` 档不动：那是刻意的「查表/算数不思考」（calc 类身份），开了纯属浪费。
+ * 2026-11-02 实测：assistant 是 low（关思考），窗口里跑一轮事件流里一条 think 都没有。
+ */
+export function effectiveThink(
+  m: AgentModule,
+  privacyChild = process.env.HIVE_PRIVACY_CHILD === '1',
+): ThinkBudget {
+  if (!privacyChild) return m.think;
+  if (m.think === 'off') return 'off';
+  return 'high';
+}
+
 export function moduleList(): AgentModule[] {
   return Object.values(MODULES);
 }

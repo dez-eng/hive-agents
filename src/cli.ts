@@ -12,7 +12,7 @@ import { silenceSqliteWarning } from './core/warn.js';
 
 silenceSqliteWarning();
 
-import { APP_NAME, VERSION, hasApiKey, loadDotEnv, modelName, toolSteps, turnBudget } from './core/config.js';
+import { APP_NAME, VERSION, envFiles, hasApiKey, loadDotEnv, toolSteps, turnBudget } from './core/config.js';
 import { parsePriceOverlay, setPriceOverlay } from './core/cost.js';
 import { classifyError } from './core/errors.js';
 import { initFiles } from './core/init.js';
@@ -42,7 +42,8 @@ import { resolve } from 'node:path';
 import { soloThread } from './core/handoff.js';
 import { COMMANDS, findCommand } from './commands.js';
 import { buildContext, printFooter, startRepl } from './repl.js';
-import { dim, gray, red } from './ui/format.js';
+import { red } from './ui/format.js';
+import { openUiSinkFromEnv } from './core/uievents.js';
 
 const USAGE = `${APP_NAME} ${VERSION} —— 缓存友好型 agent CLI
 用法：
@@ -51,6 +52,7 @@ const USAGE = `${APP_NAME} ${VERSION} —— 缓存友好型 agent CLI
   ${APP_NAME} --continue           续上一次独立会话（独立会话本就可续，这只是一个显式说法）
   ${APP_NAME} run <问题>           单轮问答（脚本用），结果写 stdout
   ${APP_NAME} privacy              隐私模式：对话只显示在防录屏窗口里（Windows）
+  ${APP_NAME} window               普通窗口界面：同一套对话流，不防录屏（Windows）
   ${APP_NAME} --as B run <问题>    以 B 身份单轮
   ${APP_NAME} init                 生成 .env.example / .hive/policy.json / hive.config.example.json
   ${APP_NAME} doctor               环境自检
@@ -60,25 +62,27 @@ const USAGE = `${APP_NAME} ${VERSION} —— 缓存友好型 agent CLI
 会话里敲 /help 看命令。`;
 
 /**
- * 启动时问一次：正常终端还是隐私窗口。
- * 只在交互式终端里调用；**必须输入 1 或 2**，直接回车不会被当成默认值。
+ * 启动时问一次：窗口界面 / 隐私窗口 / 纯终端。
+ * 只在交互式终端里调用；**必须输入 1/2/3**，直接回车不会被当成默认值。
  */
-async function askStartMode(): Promise<'repl' | 'privacy'> {
+async function askStartMode(): Promise<'window' | 'privacy' | 'repl'> {
   const { createInterface } = await import('node:readline/promises');
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     process.stdout.write(
       '\n' +
         '  启动方式\n' +
-        '    1) 正常终端\n' +
-        '    2) 隐私窗口 —— 防录屏（OBS / 腾讯会议共享看不到内容），功能与正常终端完全一致\n' +
+        '    1) 窗口界面 —— 对话流 + 思考 + 指标栏（不防录屏）\n' +
+        '    2) 隐私窗口 —— 同样的界面，且防录屏（OBS / 腾讯会议共享看不到内容）\n' +
+        '    3) 纯终端 —— 原样 REPL（脚本 / SSH / 窗口起不来时用）\n' +
         '\n',
     );
     for (;;) {
-      const ans = (await rl.question('  选择 [1/2]：')).trim();
-      if (ans === '1') return 'repl';
+      const ans = (await rl.question('  选择 [1/2/3]：')).trim();
+      if (ans === '1') return 'window';
       if (ans === '2') return 'privacy';
-      process.stdout.write('  请输入 1 或 2。\n');
+      if (ans === '3') return 'repl';
+      process.stdout.write('  请输入 1、2 或 3。\n');
     }
   } finally {
     rl.close();
@@ -113,7 +117,18 @@ async function main(): Promise<number> {
   }
 
   const parsedArgs = parse(process.argv.slice(2));
-  if (parsedArgs.privacyChild) process.env.HIVE_PRIVACY_CHILD = '1';
+  // --privacy-child：窗口里那一份 hive 必须跳过启动菜单，否则会在窗口里再问一次
+  const privacyChild = parsedArgs.privacyChild || process.env.HIVE_PRIVACY_CHILD === '1';
+  if (privacyChild) process.env.HIVE_PRIVACY_CHILD = '1';
+  // 账本脱敏是「隐私窗口」独有的：普通窗口（对话流界面但不防录屏）照常记正文，
+  // 否则 /cost、/sessions 里全是 [privacy]，正常用起来反而更难受。
+  if (parsedArgs.redact) process.env.HIVE_PRIVACY_REDACT = '1';
+  // --ui-events：窗口右栏的事件通道。走环境变量是为了让 agent / repl 随处能取到，
+  // 而 argv 里必须带 —— 窗口进程链（ps → C# → python → node）不继承原始终端的环境。
+  if (parsedArgs.uiEvents) process.env.HIVE_UI_EVENTS = parsedArgs.uiEvents;
+  const uiSink = openUiSinkFromEnv();
+  // 退出前把缓冲区刷出去：40ms 合批的最后几条（turn_end / gist）不能丢在内存里
+  if (uiSink) process.on('exit', () => uiSink.flush());
   const rest = parsedArgs.rest;
   const as = parsedArgs.as;
   const cont = parsedArgs.cont;
@@ -121,7 +136,7 @@ async function main(): Promise<number> {
 
   // v4：交互式启动先问一次「正常窗口 / 隐私窗口」。
   // 脚本、管道、HIVE_NO_ASK=1 都不问 —— 自动化的行为不能被一次提问改变。
-  if (mode === 'repl' && process.stdin.isTTY && !process.env.HIVE_NO_ASK) {
+  if (mode === 'repl' && process.stdin.isTTY && !privacyChild && !process.env.HIVE_NO_ASK) {
     mode = await askStartMode();
   }
 
@@ -152,6 +167,17 @@ async function main(): Promise<number> {
     for (const p of r.skipped) process.stdout.write(`  跳过 ${p}（已存在；--force 覆盖）\n`);
     process.stdout.write('下一步：把 .env.example 复制成 .env 填 key → hive doctor\n');
     return 0;
+  }
+
+  // 没有 key 时不要继续构造 agent：ChatDeepSeek 会在 buildContext 里直接抛异常，
+  // 用户看到的是一段 stack，而不是「缺什么、去哪里配」。
+  if (!hasApiKey()) {
+    process.stderr.write(
+      `[${APP_NAME}] 还没设 DEEPSEEK_API_KEY。\n` +
+        `        已查找：${envFiles().join('、')}\n` +
+        `        把 .env.example 复制成 .env 填上，或 set DEEPSEEK_API_KEY=sk-...\n`,
+    );
+    return 2;
   }
 
   // v4 M4.2：MCP 在 help/version 之后连 —— 那两条命令不该被 server 拖慢。
@@ -266,53 +292,81 @@ async function main(): Promise<number> {
     }
   }
 
-  // 隐私模式：对话只进防录屏窗口（WDA_EXCLUDEFROMCAPTURE）。
-  // v4.5 默认把**完整的 hive 终端**搬进窗口（xterm + ConPTY），斜杠命令、工具输出、
-  // 流式回复都在；`hive privacy --classic` 回退到旧的自绘聊天窗。
-  if (mode === 'privacy') {
+  // 窗口界面：对话流 + 思考 + 指标栏。两种用法共用同一套窗口模板 ——
+  //   2) 隐私窗口：额外设 WDA_EXCLUDEFROMCAPTURE（防录屏）+ 账本脱敏
+  //   1) 窗口界面：不设 WDA、照常记账，就是个本地窗口版终端
+  // `hive privacy` 仍直达隐私窗口；`hive privacy --classic` 是旧的自绘聊天窗。
+  if (mode === 'privacy' || mode === 'window') {
+    const isPrivacy = mode === 'privacy';
+
+    // 普通窗口起不来不该拦住人：回退纯终端并说清原因。隐私窗口则必须报错 ——
+    // 它的存在意义就是防录屏，静默降级成一个会被录进去的终端才是真问题。
+    const fallback = async (why: string): Promise<number | null> => {
+      if (isPrivacy) {
+        process.stderr.write(`[隐私窗口] ${why}\n`);
+        await mcp?.close();
+        return 2;
+      }
+      process.stderr.write(`[窗口界面] ${why}\n`);
+      process.stderr.write('[窗口界面] 已回退到纯终端。\n');
+      return null;
+    };
+
     if (!privacySupported()) {
-      process.stderr.write('[隐私模式只支持 Windows：WDA_EXCLUDEFROMCAPTURE 是 Win32 API]\n');
-      await mcp?.close();
-      return 2;
+      const failed = await fallback('窗口界面只支持 Windows（WinForms + WebView2 + WDA）');
+      if (failed !== null) return failed;
+      mode = 'repl';
     }
 
-    const paths = privacyPaths();
+    if (mode === 'privacy' || mode === 'window') {
+      const paths = privacyPaths();
 
-    if (!rest.includes('--classic')) {
-      const ready = privacyWindowReady();
-      if (!ready.ok) {
-        process.stderr.write(`[隐私模式] ${ready.reason}\n`);
-        process.stderr.write('           privacy-window/ 不完整：重新拉仓库，或确认它没被 .gitignore 掉。\n');
-        await mcp?.close();
-        return 2;
+      if (!(isPrivacy && rest.includes('--classic'))) {
+        const ready = privacyWindowReady();
+        if (!ready.ok) {
+          const failed = await fallback(
+            `${ready.reason}（privacy-window/ 不完整：重新拉仓库，或确认它没被 .gitignore 掉）`,
+          );
+          if (failed !== null) return failed;
+          mode = 'repl';
+        } else {
+          const win = await launchTuiWindow(paths, {
+            command: process.execPath,
+            // 只有隐私窗口才带 --redact：普通窗口要正常记账本正文
+            args: tuiChildArgs(privacyEntry(), ra.as, paths.events, isPrivacy),
+            workDir: process.cwd(),
+            title: isPrivacy ? 'hive - privacy mode' : 'hive',
+            noProtect: !isPrivacy,
+          });
+          if (!win.ok) {
+            const failed = await fallback(
+              `窗口启动失败：${win.reason}` +
+                (win.logHint ? `\n           窗口日志：${win.logHint}` : '') +
+                '\n           常见原因：缺 pywinpty / WebView2 运行时 / 端口被占。',
+            );
+            if (failed !== null) return failed;
+            mode = 'repl';
+          } else {
+            if (win.warning) process.stderr.write(`[窗口界面] ${win.warning}\n`);
+            if (isPrivacy && win.excluded === false) {
+              process.stderr.write('[隐私窗口] 注意：窗口没有确认防录屏（HIVE_PRIVACY_NO_PROTECT=1？）\n');
+            }
+            process.stdout.write(
+              (isPrivacy
+                ? '[隐私窗口] 已打开防录屏窗口'
+                : '[窗口界面] 已打开窗口') +
+                '（后台运行，任务栏和 Alt+Tab 里都没有它）\n' +
+                '           界面是对话流：提问、思考、工具调用、markdown 回答都在上面，\n' +
+                '           底部输入框，最下一行是模型 / 花费 / 上下文 / 命中缓存 / 余额。\n' +
+                '           Ctrl+Alt+P 显示/隐藏   Ctrl+Alt+R 重启终端   Ctrl+Alt+Q 退出\n' +
+                `           状态：${paths.status}\n` +
+                '           这个终端里不会出现对话内容，可以最小化或直接关掉。\n',
+            );
+            await mcp?.close();
+            return 0;
+          }
+        }
       }
-      const win = await launchTuiWindow(paths, {
-        command: process.execPath,
-        args: tuiChildArgs(privacyEntry(), ra.as),
-        workDir: process.cwd(),
-        title: 'hive - privacy mode',
-      });
-      if (!win.ok) {
-        process.stderr.write(`[隐私模式] 窗口启动失败：${win.reason}\n`);
-        if (win.logHint) process.stderr.write(`           窗口日志：${win.logHint}\n`);
-        process.stderr.write('           常见原因：缺 pywinpty / WebView2 运行时 / 端口被占。\n');
-        await mcp?.close();
-        return 2;
-      }
-      if (win.warning) process.stderr.write(`[隐私模式] ${win.warning}\n`);
-      if (win.excluded === false) {
-        process.stderr.write('[隐私模式] 注意：窗口没有确认防录屏（HIVE_PRIVACY_NO_PROTECT=1？）\n');
-      }
-      process.stdout.write(
-        '[隐私模式] 已打开防录屏窗口（后台运行，任务栏和 Alt+Tab 里都没有它）\n' +
-          '           窗口里是完整的 hive（工具调用 / 斜杠命令 / 模型切换都在）。\n' +
-          '           Ctrl+Alt+P 显示/隐藏   Ctrl+Alt+R 重启终端   Ctrl+Alt+Q 退出\n' +
-          `           状态：${paths.status}\n` +
-          '           这个终端里不会出现对话内容，可以最小化或直接关掉。\n',
-      );
-      await mcp?.close();
-      return 0;
-    }
 
     // ---- classic：文件桥接 + 自绘聊天窗（对话可见，但没有工具输出） ----
     ensurePrivacyDir(paths);
@@ -393,14 +447,11 @@ async function main(): Promise<number> {
     process.stdout.write('[隐私模式] 已退出（记录留在 .hive/privacy/transcript.txt）\n');
     await mcp?.close();
     return 0;
+      } // 内层：窗口模式（classic 只有 `hive privacy --classic` 才走到）
+
+    // ---- 到这里窗口模式结束 ----
   }
 
-  if (!hasApiKey()) {
-    process.stdout.write(
-      gray(`提示：还没设 DEEPSEEK_API_KEY —— 把 .env.example 复制成 .env 填上即可。\n`) +
-        dim(`      模型 ${modelName()} · 命令 ${COMMANDS.length} 个\n\n`),
-    );
-  }
   // 独立会话挂在固定 thread 上，天然可续；--continue 只是把它说清楚
   void cont;
   await startRepl(ra.as ? { as: ra.as, thread: thread! } : {});

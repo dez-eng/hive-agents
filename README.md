@@ -23,13 +23,19 @@ npm i -g github:dez-eng/hive-agents                        # 直接从 GitHub（
 npm i -g https://github.com/dez-eng/hive-agents/releases/download/v0.1.0/hive-agents-0.1.0.tgz
 ```
 
-配 key —— **不配跑不起来**。在你要干活的目录里放一份 `.env`：
+配 key —— **不配跑不起来**。启动时按优先级找三处 `.env`：
+
+1. 当前目录 `.env`（项目级，最高）
+2. `~/.hive/.env`（用户级）
+3. 包安装目录的 `.env`（全局装一次，从任意目录都能用）
 
 ```bash
 printf 'DEEPSEEK_API_KEY=sk-你的key\n' > .env
 ```
 
-或者直接 `export DEEPSEEK_API_KEY=...`。需要 **Node ≥ 22.5**（用了内置的 `node:sqlite` 与 `process.loadEnvFile`）。
+shell 里 `export DEEPSEEK_API_KEY=...` 优先级最高，不会被任何文件覆盖。
+都没有时 hive 会列出查过的路径并以退出码 2 退出，不会抛 stack。
+需要 **Node ≥ 22.5**（用了内置的 `node:sqlite` 与 `process.loadEnvFile`）。
 
 ## 用
 
@@ -124,7 +130,16 @@ MCP、`load_skill` 与 `web_fetch` 按配置动态增加）：
 **不给 shell 执行**：`spawn` 直接跑命令，不走 `sh -c` —— 走 shell 的话白名单形同虚设（`ls; rm -rf /` 的第一个词是 `ls` 就被放行了）。
 代价是管道 `|`、重定向 `>`、通配符 `*` 都不支持。
 
-另外两件：**子进程只拿到一份最小环境**（`DEEPSEEK_API_KEY` 这类名字含 `KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL` 的一律抹掉，逃生舱 `HIVE_BASH_ENV_KEEP` 也过不了这层过滤）；路径判定**解析真实路径**（项目里的符号链接指向外面会被拒）。
+**Windows 上的 `.cmd`**：`npm` / `npx` / `yarn` / `pnpm` 实际是 `.cmd`，Node 的 `spawn(bin)`
+不会按 `PATHEXT` 解析，直接 `ENOENT`。hive 先解析真实文件，`.cmd/.bat` 只经由
+`cmd.exe /d /s /v:off /c` 启动，每个参数单独加引号；含 `"` / `%` / 换行的参数会被拒绝
+（cmd 无法安全转义）。白名单仍按原始命令名判定 —— 放行 `npm` 即可，不用写 `npm.cmd`。
+
+另外三件：**子进程只拿到一份最小环境**（`DEEPSEEK_API_KEY` 这类名字含
+`KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL` 的一律抹掉，逃生舱 `HIVE_BASH_ENV_KEEP` 也过不了
+这层过滤；但补齐了 Windows 上 npm/git 需要的 `APPDATA` / `LOCALAPPDATA` / `ProgramFiles` 等）；
+路径判定**解析真实路径**（项目里的符号链接指向外面会被拒）；超时用 `taskkill /T /F`
+收整棵进程树，输出上限是 stdout + stderr **合计** 4000 字符。
 
 ### 诚实说边界
 

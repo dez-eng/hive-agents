@@ -53,10 +53,12 @@ test('判定：失败的样本不参与挑选，但全失败会说出来', () =>
   assert.equal(off?.label, 'b');
 });
 
-test('思考预算映射来自实测：off/low 关思考，high 放开', () => {
+test('思考预算映射来自实测：off/low 关思考，high 显式打开（为了拿回思考正文）', () => {
   assert.deepEqual(THINK_KWARGS.off, { thinking: { type: 'disabled' } });
   assert.deepEqual(THINK_KWARGS.low, { thinking: { type: 'disabled' } });
-  assert.deepEqual(THINK_KWARGS.high, {}, 'high 放开：默认已思考全开，不必显式 enabled');
+  // 2026-11-02 实测：不传 thinking 时 reasoning_content 恒为 null（只有 token 计数），
+  // 隐私窗口右侧思考栏会全空 —— 所以 high 必须显式 enabled。
+  assert.deepEqual(THINK_KWARGS.high, { thinking: { type: 'enabled' } });
 });
 
 test('每个模块的 think 档都有映射 —— 漏了会把 undefined 塞进 modelKwargs', () => {

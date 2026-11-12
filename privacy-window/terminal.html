@@ -1,32 +1,337 @@
 <!doctype html>
-<html>
+<html data-theme="dark">
 <head>
 <meta charset="utf-8">
-<title>reasonix privacy</title>
-<link rel="stylesheet" href="xterm/xterm.css">
+<title>hive · privacy</title>
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0c; overflow: hidden; }
-  #wrap { display: flex; flex-direction: column; height: 100vh; }
-  #bar {
-    flex: 0 0 auto; height: 24px; line-height: 24px; padding: 0 10px;
-    font: 12px Consolas, monospace; color: #8b949e; background: #161b22;
-    border-bottom: 1px solid #21262d; user-select: none;
+  /* ============================================================
+     配色：暖中性 + 单一强调色（陶土橙）。
+     不再用 GitHub 的蓝/绿/紫多色体系 —— 一屏里出现四种彩色强调，
+     视线会散；Claude 那种界面靠的是「一个颜色说话，其余全退后」。
+     明暗两套变量，data-theme 切换。
+     ============================================================ */
+  :root {
+    --sans: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+    --serif: Georgia, "Songti SC", "Noto Serif SC", "Times New Roman", serif;
+    --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+
+    --bg: #1f1e1d; --bg-elev: #262624; --bg-card: #302f2c;
+    --line: #3b3a37; --line-soft: #312f2d;
+    --fg: #f2efe9; --fg-soft: #d7d3ca;
+    --dim: #a3a09a; --dim2: #7a7772;
+    --accent: #d97757; --accent-ink: #e79a7e;
+    --accent-soft: rgba(217, 119, 87, .13);
+    --code-bg: #191918;
+    --danger: #e08c7d;
+    --hover: rgba(255, 255, 255, .055);
+    --shadow: 0 1px 2px rgba(0, 0, 0, .28), 0 8px 24px rgba(0, 0, 0, .18);
   }
-  #bar .lock { color: #3fb950; }
-  #term { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 6px 4px 0 8px; }
-  .xterm { height: 100%; }
+  html[data-theme="light"] {
+    --bg: #f7f6f1; --bg-elev: #ffffff; --bg-card: #efece4;
+    --line: #e2ded3; --line-soft: #eae6dc;
+    --fg: #2b2926; --fg-soft: #45423d;
+    --dim: #6d6a63; --dim2: #918e86;
+    --accent: #c96442; --accent-ink: #b0512f;
+    --accent-soft: rgba(201, 100, 66, .10);
+    --code-bg: #f0eee7;
+    --danger: #b3412f;
+    --hover: rgba(0, 0, 0, .045);
+    --shadow: 0 1px 2px rgba(60, 50, 40, .06), 0 8px 24px rgba(60, 50, 40, .06);
+  }
+
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: var(--bg); overflow: hidden;
+    color: var(--fg); font-family: var(--sans); font-size: 14.5px;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-soft); }
+  #wrap { display: flex; flex-direction: column; height: 100vh; }
+  .center { max-width: 760px; margin: 0 auto; }
+
+  /* ---------- 顶部：品牌 + 分段页签 + 状态 ---------- */
+  #bar {
+    flex: 0 0 auto; height: 40px; padding: 0 16px;
+    display: flex; align-items: center; gap: 12px;
+    font-size: 12px; color: var(--dim); background: var(--bg);
+    border-bottom: 1px solid var(--line-soft); user-select: none;
+  }
+  #bar .brand {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--serif); font-size: 14px; color: var(--fg-soft);
+    letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #bar .brand .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    flex: 0 0 auto;
+  }
+  #bar .right { margin-left: auto; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  #conn { color: var(--dim2); font-size: 11.5px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  #themeBtn {
+    border: 0; background: transparent; color: var(--dim); cursor: pointer;
+    font-size: 14px; line-height: 1; padding: 4px 6px; border-radius: 6px;
+  }
+  #themeBtn:hover { background: var(--hover); color: var(--fg); }
+
+  /* 分段控件：整块一个胶囊，选中项是浮起来的那一小块 */
+  #tabs {
+    display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px;
+    background: var(--bg-card);
+  }
+  #tabs button {
+    font: 11.5px var(--sans); color: var(--dim); background: transparent;
+    border: 0; border-radius: 999px; padding: 3px 12px; cursor: pointer;
+  }
+  #tabs button:hover { color: var(--fg-soft); }
+  #tabs button.on { color: var(--fg); background: var(--bg-elev); box-shadow: var(--shadow); }
+
+  /* ---------- 对话流：居中窄栏，两侧大量留白 ---------- */
+  #chat {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    padding: 26px 24px 8px; scrollbar-width: thin;
+  }
+  #chat::-webkit-scrollbar, #raw::-webkit-scrollbar { width: 8px; }
+  #chat::-webkit-scrollbar-thumb, #raw::-webkit-scrollbar-thumb {
+    background: var(--line); border-radius: 4px;
+  }
+  #chat::-webkit-scrollbar-thumb:hover, #raw::-webkit-scrollbar-thumb:hover { background: var(--dim2); }
+
+  #empty { padding: 12vh 0 0; text-align: center; color: var(--dim); user-select: none; }
+  #empty .glyph { font-size: 22px; color: var(--accent); }
+  #empty h1 {
+    font-family: var(--serif); font-weight: 400; font-size: 30px;
+    color: var(--fg); margin: 10px 0 6px; letter-spacing: .02em;
+  }
+  #empty p { margin: 0; font-size: 13.5px; color: var(--dim2); }
+
+  .msg { margin: 0 0 26px; }
+  .who {
+    font: 11px var(--sans); color: var(--dim2); margin-bottom: 7px;
+    display: flex; align-items: center; gap: 6px; user-select: none;
+  }
+  .msg.hive .who .glyph { color: var(--accent); font-size: 11px; }
+
+  /* 用户消息：右对齐的柔和气泡（助手消息不加气泡，纯文本 —— 与 Claude 一致） */
+  .msg.user { display: flex; flex-direction: column; align-items: flex-end; }
+  .msg.user .who { display: none; }
+  .msg.user .body {
+    max-width: min(78%, 600px); background: var(--bg-card);
+    border-radius: 16px 16px 4px 16px; padding: 10px 14px;
+    white-space: pre-wrap; word-break: break-word; color: var(--fg);
+    line-height: 1.6;
+  }
+
+  /* 思考：折叠成一个小胶囊，摘要就是那句中文备注（或「思考了 N 秒」） */
+  details.think { margin: 0 0 12px; }
+  details.think > summary {
+    display: inline-flex; align-items: center; gap: 7px; list-style: none;
+    cursor: pointer; user-select: none;
+    font-size: 12.5px; color: var(--dim);
+    background: var(--bg-card); border-radius: 999px; padding: 4px 12px 4px 9px;
+    max-width: 100%; transition: color .15s;
+  }
+  details.think > summary:hover { color: var(--fg-soft); }
+  details.think > summary::-webkit-details-marker { display: none; }
+  details.think > summary::before { content: "✳"; color: var(--accent); font-size: 11px; }
+  details.think > summary .sum-text {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  details.think > summary .sum-ms { color: var(--dim2); font-size: 11px; }
+  details.think > summary.waiting { color: var(--dim2); }
+  details.think > summary.waiting::before { animation: pulse 1.3s ease-in-out infinite; }
+  details.think > summary.rule { font-style: normal; }
+  details.think[open] > summary { border-radius: 12px; background: var(--bg-card); }
+  details.think .raw {
+    margin: 9px 0 2px 9px; padding-left: 12px; border-left: 1px solid var(--line);
+    color: var(--dim); font-size: 12.5px; line-height: 1.7;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 340px; overflow-y: auto;
+  }
+  @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+  /* 工具调用：低调的小 chip */
+  .tool {
+    display: inline-flex; align-items: center; gap: 5px;
+    font: 11.5px var(--mono); color: var(--fg-soft);
+    background: var(--bg-card); border-radius: 7px; padding: 2px 9px;
+    margin: 0 0 10px; user-select: none;
+  }
+  .tool .ico { font-size: 10px; color: var(--dim); }
+
+  /* 系统 / 命令输出 */
+  .msg.sys .who, .msg.err .who { display: none; }
+  .msg.sys .body {
+    color: var(--dim); font: 12px/1.6 var(--mono);
+    white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg); border-radius: 8px; padding: 8px 11px;
+  }
+  .msg.err .body {
+    color: var(--danger); font: 12px/1.6 var(--mono);
+    white-space: pre-wrap; word-break: break-word;
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    border-radius: 8px; padding: 8px 11px;
+  }
+
+  /* ---------- markdown 正文 ---------- */
+  .md { line-height: 1.75; word-break: break-word; color: var(--fg); }
+  .md p { margin: 0 0 12px; }
+  .md h1, .md h2, .md h3 {
+    font-family: var(--serif); font-weight: 600; line-height: 1.35; color: var(--fg);
+  }
+  .md h1 { font-size: 20px; margin: 20px 0 9px; }
+  .md h2 { font-size: 17px; margin: 18px 0 8px; }
+  .md h3 { font-size: 15px; margin: 16px 0 7px; }
+  .md ul, .md ol { margin: 0 0 12px; padding-left: 24px; }
+  .md li { margin: 3px 0; }
+  .md li::marker { color: var(--dim2); }
+  .md code {
+    background: var(--code-bg); padding: 1.5px 5px; border-radius: 5px;
+    font: 12.5px var(--mono); color: var(--accent-ink);
+  }
+  .md a { color: var(--accent-ink); text-decoration: none; border-bottom: 1px solid var(--accent-soft); }
+  .md a:hover { border-bottom-color: var(--accent); }
+  .md strong { color: var(--fg); font-weight: 650; }
+  .md blockquote {
+    margin: 0 0 12px; padding: 2px 0 2px 14px;
+    border-left: 2px solid var(--accent-soft); color: var(--dim);
+  }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+
+  /* 表格：不要竖线，只留行分隔 —— 竖线会把窄栏切碎 */
+  .md table { border-collapse: collapse; width: 100%; margin: 0 0 13px; font-size: 13.5px; }
+  .md th {
+    text-align: left; font-weight: 600; color: var(--fg);
+    padding: 7px 10px; border-bottom: 1px solid var(--line);
+  }
+  .md td { padding: 7px 10px; border-bottom: 1px solid var(--line-soft); color: var(--fg-soft); }
+  .md tr:last-child td { border-bottom: 0; }
+
+  /* 代码块：卡片 + 语言标签 + 复制 */
+  .md .code {
+    margin: 0 0 13px; border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; background: var(--code-bg);
+  }
+  .md .code-h {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--line);
+    font: 11px var(--mono); color: var(--dim2); user-select: none;
+  }
+  .md .code-h .copy {
+    font: 11px var(--mono); color: var(--dim); background: transparent;
+    border: 0; border-radius: 5px; padding: 2px 7px; cursor: pointer;
+  }
+  .md .code-h .copy:hover { color: var(--fg); background: var(--hover); }
+  .md .code pre { margin: 0; padding: 11px 13px; overflow-x: auto; }
+  .md .code code {
+    background: none; padding: 0; color: var(--fg-soft);
+    font: 12.5px/1.65 var(--mono);
+  }
+
+  /* 流式光标 */
+  .md.streaming > :last-child::after,
+  .md.streaming:empty::after {
+    content: "▍"; color: var(--accent); margin-left: 1px;
+    animation: pulse 1.1s steps(2, start) infinite;
+  }
+
+  /* ---------- 终端页签（原始输出兜底） ---------- */
+  #raw {
+    flex: 1 1 auto; min-height: 0; margin: 0; padding: 12px 16px;
+    display: none; overflow: auto; background: var(--code-bg); color: var(--dim);
+    font: 12px/1.5 var(--mono);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #wrap.rawmode #chat { display: none; }
+  #wrap.rawmode #raw { display: block; }
+
+  /* ---------- 底部指标栏：信息都在，但视觉重量降到最低 ---------- */
+  #stats {
+    flex: 0 0 auto; padding: 5px 24px 6px;
+    font: 11.5px/1.5 var(--sans); color: var(--dim2);
+    border-top: 1px solid var(--line-soft);
+    /* 不用 nowrap：窗口缩到最小宽度（760）时一行放不下，省略号会把余额吃掉。
+       宁可折成两行 —— 这一栏的价值就在于数字全都在。 */
+  }
+  #stats b { color: var(--dim); font-weight: 500; }
+  #stats .dot { color: var(--line); margin: 0 7px; }
+  #stats .peak { color: var(--accent-ink); }
+  #stats .off { color: var(--dim); }
+  #stats .bal b { color: var(--fg-soft); }
+
+  /* ---------- 输入区：卡片式，底部收紧 ---------- */
+  #composer { flex: 0 0 auto; background: var(--bg); padding: 8px 24px 12px; }
+  #composer .box {
+    display: flex; align-items: flex-end; gap: 8px;
+    background: var(--bg-elev); border: 1px solid var(--line);
+    border-radius: 15px; padding: 9px 10px 9px 14px;
+    box-shadow: var(--shadow); transition: border-color .15s;
+  }
+  #composer .box:focus-within { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  #input {
+    flex: 1 1 auto; width: 100%; box-sizing: border-box; resize: none;
+    min-height: 24px; max-height: 190px;
+    background: transparent; color: var(--fg); border: 0; padding: 2px 0;
+    font: 14.5px/1.6 var(--sans); outline: none;
+  }
+  #input::placeholder { color: var(--dim2); }
+  #sendBtn {
+    flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%;
+    border: 0; cursor: pointer; font-size: 15px; line-height: 1;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity .15s, transform .15s;
+  }
+  #sendBtn:hover { transform: translateY(-1px); }
+  #sendBtn:disabled { background: var(--bg-card); color: var(--dim2); cursor: default; transform: none; }
+
+  #hint {
+    margin-top: 7px; font: 11px var(--sans); color: var(--dim2);
+    display: flex; gap: 14px; user-select: none;
+  }
+  #hint .right { margin-left: auto; }
+  kbd {
+    background: var(--bg-card); border-radius: 4px;
+    padding: 1px 5px; font: 10.5px var(--mono); color: var(--dim);
+  }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="bar"><span class="lock">&#9679;</span> hive &middot; privacy mode &middot; excluded from capture</div>
-  <div id="term"></div>
+  <div id="bar">
+    <span class="brand"><span class="dot"></span><span id="barText">hive</span></span>
+    <span id="tabs">
+      <button id="tabChat" class="on">对话</button>
+      <button id="tabRaw">终端</button>
+    </span>
+    <span class="right">
+      <span id="conn">连接中…</span>
+      <button id="themeBtn" title="切换明暗主题">☾</button>
+    </span>
+  </div>
+
+  <div id="chat"><div id="thread" class="center"></div></div>
+  <pre id="raw"></pre>
+
+  <div id="stats"><div class="center">&nbsp;</div></div>
+
+  <div id="composer">
+    <div class="center">
+      <div class="box">
+        <textarea id="input" rows="1" placeholder="给 hive 说点什么…"></textarea>
+        <button id="sendBtn" type="button" title="发送" disabled>↑</button>
+      </div>
+      <div id="hint">
+        <span><kbd>Enter</kbd> 发送</span>
+        <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+        <span><kbd>Ctrl</kbd>+<kbd>C</kbd> 中断本轮</span>
+        <span class="right" id="connHint">对话流</span>
+      </div>
+    </div>
+  </div>
 </div>
-<script src="xterm/xterm.js"></script>
+
 <script>
 (function () {
   var host = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
-  // Always send JSON strings: the C# side reads them with TryGetWebMessageAsString.
   var post = function (m) { if (host) { try { host.postMessage(JSON.stringify(m)); } catch (_) { } } };
 
   function b64utf8(s) {
@@ -36,53 +341,453 @@
     return btoa(bin);
   }
 
-  var term = new Terminal({
-    cursorBlink: true,
-    fontSize: 14,
-    fontFamily: 'Consolas, "Cascadia Mono", monospace',
-    scrollback: 8000,
-    allowProposedApi: true,
-    theme: {
-      background: '#0b0b0c', foreground: '#d6d6d6', cursor: '#4ec9b0',
-      selectionBackground: '#264f78',
-      black: '#1e1e1e', red: '#f14c4c', green: '#4ec9b0', yellow: '#dcdcaa',
-      blue: '#569cd6', magenta: '#c586c0', cyan: '#4dc9b0', white: '#d4d4d4',
-      brightBlack: '#6e7681', brightRed: '#f97583', brightGreen: '#56d364',
-      brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
-      brightCyan: '#56d4dd', brightWhite: '#ffffff'
-    }
+  /* ================= 主题 ================= */
+
+  function applyTheme(name) {
+    document.documentElement.setAttribute('data-theme', name);
+    document.getElementById('themeBtn').textContent = name === 'light' ? '☀' : '☾';
+    document.getElementById('themeBtn').title = name === 'light' ? '切换到深色' : '切换到浅色';
+    try { localStorage.setItem('hive.theme', name); } catch (_) { }
+    // 系统标题栏也要跟着换，否则暗色正文顶着一条白标题栏
+    post({ type: 'theme', dark: name === 'light' ? 0 : 1 });
+  }
+  var savedTheme = null;
+  try { savedTheme = localStorage.getItem('hive.theme'); } catch (_) { }
+  applyTheme(savedTheme === 'light' ? 'light' : 'dark');
+  document.getElementById('themeBtn').addEventListener('click', function () {
+    applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
   });
 
-  term.open(document.getElementById('term'));
-  term.focus();
+  var chat = document.getElementById('chat');
+  var thread = document.getElementById('thread');
+  var rawPre = document.getElementById('raw');
+  var statsEl = document.querySelector('#stats .center');
+  var inputEl = document.getElementById('input');
+  var sendBtn = document.getElementById('sendBtn');
+  var wrapEl = document.getElementById('wrap');
+  var connEl = document.getElementById('conn');
+  var connHint = document.getElementById('connHint');
 
-  term.onData(function (d) { post({ type: 'input', data: b64utf8(d) }); });
-  term.onBinary(function (d) { post({ type: 'input', data: b64utf8(d) }); });
+  /* ================= 简易 markdown ================= */
 
-  var lastCols = 0, lastRows = 0;
-  function reportSize() {
-    if (term.cols === lastCols && term.rows === lastRows) return;
-    lastCols = term.cols; lastRows = term.rows;
-    post({ type: 'resize', cols: term.cols, rows: term.rows });
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 
-  function onHostMessage(e) {
-    var m;
-    try { m = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data; } catch (_) { return; }
-    if (!m || !m.type) return;
-    if (m.type === 'output') {
-      if (m.b64) {
-        try { term.write(b64dec(m.b64)); } catch (_) { }
-      } else if (m.data) {
-        term.write(m.data);
+  // 行内规则：代码 → 粗体 → 斜体 → 链接
+  function inline(s) {
+    var codes = [];
+    s = s.replace(/`([^`]+)`/g, function (_, c) {
+      codes.push(c);
+      return '\u0000C' + (codes.length - 1) + '\u0000';
+    });
+    s = esc(s);
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, t, u) {
+      // 只放行 http(s)，别让模型输出塞 javascript:
+      if (!/^https?:\/\//i.test(u)) return t;
+      return '<a href="' + esc(u) + '" target="_blank" rel="noreferrer">' + t + '</a>';
+    });
+    s = s.replace(/\u0000C(\d+)\u0000/g, function (_, i) { return '<code>' + esc(codes[+i]) + '</code>'; });
+    return s;
+  }
+
+  // 表格：| a | b | + 分隔行 |---|---|
+  function isTableSep(line) {
+    return /^\s*\|?[\s:-]*-[\s:|-]*\|?\s*$/.test(line) && line.indexOf('-') >= 0;
+  }
+  function splitRow(line) {
+    var t = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+    return t.split('|').map(function (c) { return c.trim(); });
+  }
+
+  function renderMd(src) {
+    var lines = String(src || '').replace(/\r\n/g, '\n').split('\n');
+    var out = [];
+    var i = 0;
+    var listBuf = null;   // 'ul' | 'ol'
+
+    function flushList() {
+      if (listBuf) { out.push('</' + listBuf + '>'); listBuf = null; }
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+
+      // 围栏代码块：语言标签 + 复制按钮
+      var fence = line.match(/^\s*```([\w+#.-]*)\s*$/);
+      if (fence) {
+        flushList();
+        var body = [];
+        i += 1;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { body.push(lines[i]); i += 1; }
+        i += 1; // 跳过结束围栏
+        out.push(
+          '<div class="code">' +
+            '<div class="code-h"><span class="lang">' + esc(fence[1] || 'code') + '</span>' +
+            '<button class="copy" type="button">复制</button></div>' +
+            '<pre><code>' + esc(body.join('\n')) + '</code></pre>' +
+          '</div>');
+        continue;
       }
-    } else if (m.type === 'focus') {
-      term.focus();
-    } else if (m.type === 'status') {
-      var bar = document.getElementById('bar');
-      bar.innerHTML = '<span class="lock">&#9679;</span> ' + m.text;
+
+      // 表格
+      if (line.indexOf('|') >= 0 && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+        flushList();
+        var head = splitRow(line);
+        i += 2;
+        var rows = [];
+        while (i < lines.length && lines[i].indexOf('|') >= 0 && lines[i].trim() !== '') {
+          rows.push(splitRow(lines[i]));
+          i += 1;
+        }
+        var html = '<table><thead><tr>' + head.map(function (h) { return '<th>' + inline(h) + '</th>'; }).join('') + '</tr></thead><tbody>';
+        rows.forEach(function (r) {
+          html += '<tr>' + r.map(function (c) { return '<td>' + inline(c) + '</td>'; }).join('') + '</tr>';
+        });
+        out.push(html + '</tbody></table>');
+        continue;
+      }
+
+      // 标题
+      var h = line.match(/^(#{1,3})\s+(.*)$/);
+      if (h) {
+        flushList();
+        var lv = h[1].length;
+        out.push('<h' + lv + '>' + inline(h[2]) + '</h' + lv + '>');
+        i += 1;
+        continue;
+      }
+
+      // 分隔线
+      if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+        flushList();
+        out.push('<hr>');
+        i += 1;
+        continue;
+      }
+
+      // 引用
+      if (/^\s*>\s?/.test(line)) {
+        flushList();
+        var q = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+          q.push(lines[i].replace(/^\s*>\s?/, ''));
+          i += 1;
+        }
+        out.push('<blockquote>' + inline(q.join(' ')) + '</blockquote>');
+        continue;
+      }
+
+      // 列表
+      var ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      var ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        var kind = ul ? 'ul' : 'ol';
+        if (listBuf !== kind) { flushList(); out.push('<' + kind + '>'); listBuf = kind; }
+        out.push('<li>' + inline((ul || ol)[1]) + '</li>');
+        i += 1;
+        continue;
+      }
+
+      // 空行
+      if (line.trim() === '') { flushList(); i += 1; continue; }
+
+      // 普通段落（连续行合并）
+      flushList();
+      var para = [line];
+      i += 1;
+      while (i < lines.length && lines[i].trim() !== '' &&
+             !/^\s*```/.test(lines[i]) && !/^(#{1,3})\s/.test(lines[i]) &&
+             !/^\s*[-*+]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) &&
+             !/^\s*>/.test(lines[i]) && lines[i].indexOf('|') < 0) {
+        para.push(lines[i]);
+        i += 1;
+      }
+      out.push('<p>' + inline(para.join(' ')) + '</p>');
+    }
+    flushList();
+    return out.join('');
+  }
+
+  /* ================= 对话流 ================= */
+
+  // 当前这一轮的助手消息块
+  var cur = { msg: null, md: null, text: '', pendingGists: [], lastThink: null };
+
+  function pinned() { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60; }
+  function follow(wasPinned) { if (wasPinned) chat.scrollTop = chat.scrollHeight; }
+
+  function resetThread() {
+    thread.innerHTML = '';
+    var empty = document.createElement('div');
+    empty.id = 'empty';
+    empty.innerHTML = '<div class="glyph">✳</div><h1>hive</h1><p>开始一段对话，思考过程会折叠在上方。</p>';
+    thread.appendChild(empty);
+  }
+  function dropEmpty() {
+    var e = document.getElementById('empty');
+    if (e) e.parentNode.removeChild(e);
+  }
+
+  function addMsg(kind, who) {
+    dropEmpty();
+    var el = document.createElement('div');
+    el.className = 'msg ' + kind;
+    var w = document.createElement('div');
+    w.className = 'who';
+    w.innerHTML = '<span class="glyph">✳</span>' + esc(who);
+    var b = document.createElement('div');
+    b.className = 'body';
+    el.appendChild(w);
+    el.appendChild(b);
+    thread.appendChild(el);
+    return { el: el, body: b };
+  }
+
+  function ensureHiveMsg() {
+    if (!cur.msg) {
+      var m = addMsg('hive', 'hive');
+      cur.msg = m.el;
+      cur.body = m.body;
+      cur.md = document.createElement('div');
+      cur.md.className = 'md';
+      m.body.appendChild(cur.md);
+      cur.text = '';
+    }
+    return cur.body;
+  }
+
+  function addUser(text) {
+    var wasPinned = pinned();
+    var m = addMsg('user', '你');
+    m.body.textContent = text;
+    cur.msg = null; cur.md = null; cur.text = '';
+    cur.pendingGists = [];
+    cur.lastThink = null;
+    follow(wasPinned);
+  }
+
+  function addSystem(text, isError) {
+    var wasPinned = pinned();
+    var m = addMsg(isError ? 'sys err' : 'sys', isError ? '错误' : '系统');
+    m.body.textContent = text;
+    follow(wasPinned);
+  }
+
+  function addThink(d) {
+    var body = ensureHiveMsg();
+    var wasPinned = pinned();
+    if (!cur.lastThink || cur.lastThink.closed) {
+      var det = document.createElement('details');
+      det.className = 'think';
+      var sum = document.createElement('summary');
+      sum.className = 'waiting';
+      var st = document.createElement('span');
+      st.className = 'sum-text';
+      st.textContent = '正在思考';
+      var ms = document.createElement('span');
+      ms.className = 'sum-ms';
+      sum.appendChild(st);
+      sum.appendChild(ms);
+      var raw = document.createElement('div');
+      raw.className = 'raw';
+      det.appendChild(sum);
+      det.appendChild(raw);
+      // 插到正文之前（思考在回答前面）
+      body.insertBefore(det, cur.md);
+      cur.lastThink = { el: det, sum: sum, sumText: st, sumMs: ms, raw: raw, closed: false };
+      cur.pendingGists.push(cur.lastThink);
+    }
+    cur.lastThink.raw.textContent += d;
+    follow(wasPinned);
+  }
+
+  function endThink(ms) {
+    if (!cur.lastThink) return;
+    var t = cur.lastThink;
+    t.closed = true;
+    t.sum.classList.remove('waiting');
+    t.sumText.textContent = '思考过程';
+    // 右侧留一句耗时（拿到 gist 后主文本换成备注，耗时不丢）
+    if (ms) t.sumMs.textContent = Math.max(1, Math.round(ms / 1000)) + 's';
+    cur.lastThink = null;
+  }
+
+  function addGist(text, source) {
+    var t = cur.pendingGists.shift() || null;
+    if (!t) return;
+    t.sumText.textContent = text;
+    t.sum.classList.remove('waiting');
+    if (source === 'rule') t.sum.classList.add('rule');
+  }
+
+  function addTool(name) {
+    var body = ensureHiveMsg();
+    var wasPinned = pinned();
+    var el = document.createElement('div');
+    el.className = 'tool';
+    el.innerHTML = '<span class="ico">⚙</span>' + esc(name);
+    body.insertBefore(el, cur.md);
+    follow(wasPinned);
+  }
+
+  function addSay(d) {
+    ensureHiveMsg();
+    cur.text += d;
+    // 流式阶段先当纯文本（markdown 半截渲染会抖），收尾时整段重排
+    cur.md.textContent = cur.text;
+    cur.md.classList.add('streaming');
+    follow(pinned());
+  }
+
+  function finishSay(full) {
+    ensureHiveMsg();
+    cur.text = full == null ? cur.text : full;
+    cur.md.classList.remove('streaming');
+    cur.md.innerHTML = renderMd(cur.text);
+  }
+
+  /* ================= 代码块复制 ================= */
+
+  function copyText(text, btn) {
+    function done() {
+      btn.textContent = '已复制';
+      setTimeout(function () { btn.textContent = '复制'; }, 1400);
+    }
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (_) { btn.textContent = '复制失败'; }
+      document.body.removeChild(ta);
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, fallback);
+        return;
+      }
+    } catch (_) { }
+    fallback();
+  }
+
+  chat.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.copy') : null;
+    if (!btn) return;
+    var box = btn.closest('.code');
+    var codeEl = box ? box.querySelector('code') : null;
+    if (codeEl) copyText(codeEl.textContent, btn);
+  });
+
+  /* ================= 底部指标栏 ================= */
+
+  function money(v, currency) {
+    if (v === null || v === undefined || isNaN(v)) return '—';
+    var sym = currency === 'CNY' ? '¥' : '$';
+    var digits = Math.abs(v) < 0.01 ? 6 : Math.abs(v) < 1 ? 4 : 2;
+    return sym + Number(v).toFixed(digits);
+  }
+  function tok(v) {
+    if (!v) return '0';
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+    return String(v);
+  }
+  function pct(v) { return Math.round((v || 0) * 100) + '%'; }
+  function dot() { return '<span class="dot">·</span>'; }
+
+  function renderStats(s) {
+    var band = s.band === 'peak' ? '<span class="peak">峰时</span>' : '<span class="off">谷时</span>';
+    statsEl.innerHTML = [
+      esc(s.model || '—'),
+      band,
+      '本轮 <b>' + money(s.cost, 'USD') + '</b>（思考 ' + (s.reasonPct || 0) + '%）',
+      '上下文 <b>' + tok(s.ctxTok) + '</b>',
+      '缓存 <b>' + tok(s.cacheHit) + '</b>（' + pct(s.hitRate) + '）',
+      '会话 <b>' + money(s.sessionCost, 'USD') + '</b> · ' + (s.turns || 0) + ' 轮',
+      '均 <b>' + money(s.avgCost, 'USD') + '</b>',
+      '余额 <span class="bal"><b>' + money(s.balance, s.balanceCurrency) + '</b></span>'
+    ].join(dot());
+  }
+
+  /* ================= 事件分派 ================= */
+
+  function onUiEvent(e) {
+    if (!e || !e.t) return;
+    switch (e.t) {
+      case 'session':
+        resetThread();
+        cur = { msg: null, md: null, text: '', pendingGists: [], lastThink: null };
+        connEl.textContent = '已连接' + (e.model ? ' · ' + e.model : '') + (e.module ? ' · ' + e.module : '');
+        renderStats({ model: e.model, band: 'off', cost: 0, ctxTok: 0, cacheHit: 0, hitRate: 0, sessionCost: 0, turns: 0, avgCost: 0, balance: null });
+        break;
+      case 'turn':
+        addUser(e.text);
+        break;
+      case 'think':
+        addThink(e.d);
+        break;
+      case 'think_end':
+        endThink(e.ms);
+        break;
+      case 'gist':
+        addGist(e.gist, e.source);
+        break;
+      case 'tool':
+        addTool(e.name);
+        break;
+      case 'say':
+        addSay(e.d);
+        break;
+      case 'say_done':
+        finishSay(e.text);
+        break;
+      case 'out':
+        addSystem(e.text, false);
+        break;
+      case 'note':
+        addSystem(e.text, e.kind === 'error');
+        break;
+      case 'stats':
+        renderStats(e.stats || {});
+        break;
+      case 'turn_end':
+        // 备注是异步的，3s 内没来就收掉等待态（文本保留 endThink 写好的「思考了 N 秒」）
+        setTimeout(function () {
+          for (var i = 0; i < cur.pendingGists.length; i++) {
+            cur.pendingGists[i].sum.classList.remove('waiting');
+          }
+          cur.pendingGists = [];
+        }, 3000);
+        connEl.textContent = '就绪';
+        break;
+      default:
+        break;
     }
   }
+
+  /* ================= 终端页签：原始输出兜底 ================= */
+
+  var rawBuf = '';
+  function stripAnsi(s) {
+    return String(s)
+      .replace(/\u001b\][^\u0007]*\u0007/g, '')      // OSC
+      .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')   // CSI
+      .replace(/\u001b[@-Z\\-_]/g, '')               // 其它 ESC
+      .replace(/\r(?!\n)/g, '');                     // 单 \r 重绘
+  }
+  function appendRaw(text) {
+    rawBuf += text;
+    if (rawBuf.length > 400000) rawBuf = rawBuf.slice(-300000);
+    rawPre.textContent = stripAnsi(rawBuf);
+    if (wrapEl.classList.contains('rawmode')) rawPre.scrollTop = rawPre.scrollHeight;
+  }
+
+  /* ================= 宿主消息 ================= */
 
   function b64dec(s) {
     var bin = atob(s);
@@ -91,46 +796,119 @@
     return new TextDecoder().decode(bytes);
   }
 
+  function onHostMessage(e) {
+    var m;
+    try { m = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data; } catch (_) { return; }
+    if (!m || !m.type) return;
+    if (m.type === 'output') {
+      appendRaw(m.b64 ? b64dec(m.b64) : (m.data || ''));
+    } else if (m.type === 'focus') {
+      inputEl.focus();
+    } else if (m.type === 'status') {
+      document.getElementById('barText').textContent = m.text;
+    } else if (m.type === 'ui') {
+      var ev;
+      try { ev = JSON.parse(m.line); } catch (_) { return; }
+      onUiEvent(ev);
+    }
+  }
+
+  /* ================= 输入 ================= */
+
+  function send(text) {
+    if (!text) return false;
+    post({ type: 'input', data: b64utf8(text + '\r') });
+    return true;
+  }
+
+  function syncSendBtn() {
+    sendBtn.disabled = inputEl.value.trim() === '';
+  }
+
+  function submit() {
+    var v = inputEl.value.replace(/\s+$/, '');
+    if (!v.trim()) return;
+    if (send(v)) {
+      inputEl.value = '';
+      autoGrow();
+      syncSendBtn();
+    }
+  }
+
+  var composing = false;
+  inputEl.addEventListener('compositionstart', function () { composing = true; });
+  inputEl.addEventListener('compositionend', function () { composing = false; });
+
+  inputEl.addEventListener('keydown', function (e) {
+    // 中文输入法组字时的 Enter 是确认候选，不能当发送
+    if (e.key === 'Enter' && !e.shiftKey && !composing && !e.isComposing) {
+      e.preventDefault();
+      submit();
+      return;
+    }
+    // Ctrl+C：交给 hive 中断本轮（PTY 里就是 0x03）
+    if (e.key === 'c' && (e.ctrlKey || e.metaKey) && !window.getSelection().toString()) {
+      e.preventDefault();
+      post({ type: 'input', data: b64utf8('\x03') });
+    }
+  });
+
+  sendBtn.addEventListener('click', function () {
+    submit();
+    inputEl.focus();
+  });
+
+  function autoGrow() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 190) + 'px';
+  }
+  inputEl.addEventListener('input', function () { autoGrow(); syncSendBtn(); });
+
+  /* ================= 页签 ================= */
+
+  document.getElementById('tabChat').addEventListener('click', function () {
+    wrapEl.classList.remove('rawmode');
+    this.classList.add('on');
+    document.getElementById('tabRaw').classList.remove('on');
+    connHint.textContent = '对话流';
+    inputEl.focus();
+  });
+  document.getElementById('tabRaw').addEventListener('click', function () {
+    wrapEl.classList.add('rawmode');
+    this.classList.add('on');
+    document.getElementById('tabChat').classList.remove('on');
+    connHint.textContent = '原始输出';
+    rawPre.scrollTop = rawPre.scrollHeight;
+  });
+
+  /* ================= 启动 ================= */
+
+  resetThread();
+
   if (host) {
     host.addEventListener('message', onHostMessage);
   } else {
-    term.writeln('\x1b[33m[preview]\x1b[0m no WebView2 host - this page is rendered inside reasonix-privacy.ps1');
-    term.writeln('');
+    // 预览模式：喂一份假事件，方便单独调界面
+    connEl.textContent = '预览模式（无 WebView2 宿主）';
+    onUiEvent({ t: 'session', model: 'deepseek-flash', thread: 'main', module: 'assistant' });
+    onUiEvent({ t: 'turn', text: '帮我实现用户登录功能，分四块做' });
+    onUiEvent({ t: 'think', d: 'We need implement user login. The user wants four blocks. I should read src/core/auth.ts first and decide whether to extend it.' });
+    onUiEvent({ t: 'think_end', chars: 130, ms: 8400 });
+    onUiEvent({ t: 'gist', gist: '先看现有 auth 模块，再决定扩展还是新建', source: 'model' });
+    onUiEvent({ t: 'tool', name: 'read_file' });
+    onUiEvent({ t: 'say', d: '我看了 `src/core/auth.ts`，现在把它拆成四块：\n\n1. **接口设计**：`POST /login`\n2. **密码哈希**：用 bcrypt\n3. **会话签发**：JWT，15 分钟过期\n4. **测试**：覆盖哈希与过期路径\n\n```ts\nexport async function login(user: string, pass: string) {\n  const ok = await verify(user, pass);\n  if (!ok) throw new Error("bad credentials");\n  return issueToken(user);\n}\n```\n\n| 步骤 | 预计耗时 |\n|---|---|\n| 接口 | 20min |\n| 哈希 | 15min |\n| 会话签发 | 15min |' });
+    onUiEvent({ t: 'say_done', text: '我看了 `src/core/auth.ts`，现在把它拆成四块：\n\n1. **接口设计**：`POST /login`\n2. **密码哈希**：用 bcrypt\n3. **会话签发**：JWT，15 分钟过期\n4. **测试**：覆盖哈希与过期路径\n\n```ts\nexport async function login(user: string, pass: string) {\n  const ok = await verify(user, pass);\n  if (!ok) throw new Error("bad credentials");\n  return issueToken(user);\n}\n```\n\n| 步骤 | 预计耗时 |\n|---|---|\n| 接口 | 20min |\n| 哈希 | 15min |\n| 会话签发 | 15min |' });
+    onUiEvent({ t: 'stats', stats: { model: 'deepseek-flash', band: 'off', cost: 0.000412, reasonPct: 32, ctxTok: 7100, cacheHit: 1280, hitRate: 0.92, sessionCost: 0.0012, turns: 12, avgCost: 0.0001, balance: 5.8, balanceCurrency: 'CNY' } });
+    onUiEvent({ t: 'turn_end', ok: true });
   }
 
-  document.getElementById('term').addEventListener('mouseup', function () { term.focus(); });
-  document.getElementById('term').addEventListener('click', function () { term.focus(); });
-
-  // xterm boots at 80x24; without this the terminal only fills the top-left corner of a
-  // 1240x820 window, and the PTY would run at the wrong size. Measure the cell size from
-  // what xterm itself rendered rather than from a font probe - they differ by a pixel or
-  // two, and that is enough to spawn a scrollbar.
-  function fit() {
-    var el = document.getElementById('term');
-    var screen = el.querySelector('.xterm-screen');
-    if (!screen || !term.cols || !term.rows) return;
-    var cellW = screen.offsetWidth / term.cols;
-    var cellH = screen.offsetHeight / term.rows;
-    if (!cellW || !cellH) return;
-    var cols = Math.floor((el.clientWidth - 14) / cellW);   // #term padding, see CSS
-    var rows = Math.floor((el.clientHeight - 8) / cellH);
-    cols = Math.max(20, cols);
-    rows = Math.max(6, rows);
-    if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
-  }
-
-  window.addEventListener('resize', function () {
-    fit();
-    reportSize();
-  });
-
-  term.onResize(function () { reportSize(); });
-
-  // 等一帧让布局稳定，量一次真实单元格尺寸，再报初始尺寸
+  // 不再用 xterm 量尺寸：对话流不需要终端列宽，PTY 固定 120×40
+  // （hive 里面板表格按 120 列排版，够用；需要矩阵时去「终端」页签）
   setTimeout(function () {
-    fit();
-    post({ type: 'ready', cols: term.cols, rows: term.rows });
-    reportSize();
+    post({ type: 'ready', cols: 120, rows: 40 });
+    inputEl.focus();
+    autoGrow();
+    syncSendBtn();
   }, 60);
 })();
 </script>

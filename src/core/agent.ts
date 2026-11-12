@@ -35,15 +35,18 @@ import { ChatDeepSeek } from '@langchain/deepseek';
 
 import { BudgetExceeded, exceedsBudget, isBudgetExceeded, tokenSpent } from './budget.js';
 import { baseUrl, compressAt, compressKeep, maxOut, memoryPath, modelName, toolSteps } from './config.js';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import type { LLMResult } from '@langchain/core/outputs';
 import { debug } from './debug.js';
 import type { Token } from './grant.js';
 import { makeTaskId, parseHandoffInput, type HandoffInput, type HandoffResult } from './handoff.js';
 import type { Ledger } from './ledger.js';
 import { TokenMeter } from './meter.js';
-import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
+import { DEFAULT_MODULE, MODULES, AGENTS, DEFAULT_AGENT, getModule, effectiveThink, type AgentId, type AgentModule, type ThinkBudget } from './modules.js';
 import { STABLE_PREFIX, TAIL_MARK, renderUserContent } from './prompt.js';
 import { continueSubagent, runSubagent, type TurnRunner } from './subagent.js';
 import { THINK_KWARGS } from './think.js';
+import { emitUi } from './uievents.js';
 import { TOOL_MAP, capabilityOfTool, isMcpTool, kindOf, mcpServerOf, toolsFor } from './capability.js';
 import { checkAction, type Action } from './policy.js';
 import { isSkillTool, loadSkillByName, withSkill, type LoadResult, type LoadedSkill } from './skill.js';
@@ -95,11 +98,27 @@ export interface ParentContext {
   taskId: string;
 }
 
+/**
+ * 一轮里除了可见文本之外，窗口右栏还要知道的三种动静。
+ * 和全局 `emitUi` 的区别：钩子是**这一个调用方**拿到的回调，做「按轮生成备注」
+ * 比在事件总线里猜上下文方便。
+ */
+export interface TurnHooks {
+  /** 思考正文增量（已确认非空） */
+  onThink?: (piece: string) => void;
+  /** 一段思考结束：该给它配一句中文备注了 */
+  onThinkEnd?: () => void;
+  /** 模型决定调用某个工具 */
+  onTool?: (name: string) => void;
+}
+
 export interface TurnRequest {
   text: string;
   threadId: string;
   module: AgentModule;
   tail: boolean;
+  /** 隐私窗口右栏的钩子。不传也照样走全局事件通道 */
+  hooks?: TurnHooks;
   /** v2：这一轮的 token 预算闸门。0 / 不传 = 无闸门 */
   budgetTokens?: number;
   /** v4 M4.3：中止信号 —— Ctrl+C 只停当前轮，不杀会话 */
@@ -200,6 +219,45 @@ function buildModel(modelId: string, think: ThinkBudget): ChatDeepSeek {
     ...(cap ? { maxTokens: cap } : {}),
     ...(Object.keys(kwargs).length ? { modelKwargs: kwargs } : {}),
   });
+}
+
+/**
+ * 从「一次模型调用结束」的回调里捞思考正文。
+ *
+ * 为什么不用流里的 chunk：实测（2026-11-02）LangGraph 的 `streamMode:'messages'`
+ * 会把 `additional_kwargs.reasoning_content` 冲成 null / 空串 —— 裸 `ChatDeepSeek.stream`
+ * 里明明是逐块中文增量（"我们需要" / "回答" / "中文" …）。也就是说走 graph 的流拿不到思考，
+ * 只有 handleLLMEnd 拿到的**合并后完整消息**里还留着全文。
+ *
+ * 代价：思考是整段出现而不是逐字流出。但备注本来就等这段思考结束才生成，
+ * 两者一起出现反而更整齐 —— 用户看到的是「一段思考 + 一句中文备注」。
+ */
+class ReasoningCollector extends BaseCallbackHandler {
+  name = 'hive-reasoning-collector';
+  private started = 0;
+
+  constructor(private readonly onReasoning: (text: string, ms: number) => void) {
+    super();
+  }
+
+  override handleLLMStart(): void {
+    this.started = Date.now();
+  }
+
+  override handleLLMEnd(output: LLMResult): void {
+    try {
+      const ms = this.started ? Date.now() - this.started : 0;
+      for (const batch of output?.generations ?? []) {
+        for (const g of batch) {
+          const msg = (g as { message?: { additional_kwargs?: { reasoning_content?: unknown } } }).message;
+          const r = msg?.additional_kwargs?.reasoning_content;
+          if (typeof r === 'string' && r.trim()) this.onReasoning(r, ms);
+        }
+      }
+    } catch {
+      /* 拿不到思考不该影响这一轮 */
+    }
+  }
 }
 
 function asObj(v: unknown): Record<string, unknown> {
@@ -912,7 +970,7 @@ export class HiveAgent {
       delegate: req.delegate ?? null,
       parent: req.parent ?? null,
       question: null,
-      think: req.module.think,
+      think: effectiveThink(req.module),
       agent: req.agent,
       ledger: req.ledger ?? null,
       threadId: req.threadId,
@@ -931,9 +989,12 @@ export class HiveAgent {
       // 一批工具 = 「agent + tools」两次跳转，所以必须把上限抬到 2×步数 + 余量，
       // 否则先抛的是 GraphRecursionError（那是报错，不是我们想要的「安静停下」）。
       const steps = toolSteps();
+      // 可变数组：meter 先挂（从第一块开始计量），思考收集器要等 closeThink
+      // 定义好之后才 push 进来 —— 它复用同一套「一段思考结束」的逻辑。
+      const callbacks: BaseCallbackHandler[] = [meter];
       const config = {
         configurable: { thread_id: req.threadId },
-        callbacks: [meter],
+        callbacks,
         streamMode: 'messages' as const,
         recursionLimit: steps > 0 ? steps * 2 + 6 : 1000,
         // v4 M4.3：中止信号沿 config 传到模型请求与工具执行
@@ -941,6 +1002,32 @@ export class HiveAgent {
       };
 
       let text = '';
+      // 思考段落：流里的 reasoning_content 是一段一段来的（模型一次调用 = 一段思考）。
+      // 出现可见正文或走到工具节点就算这段结束 —— 右栏在这里补一句话备注。
+      const hooks = req.hooks;
+      let thinkChars = 0;
+      let thinkStart = 0;
+      const closeThink = (): void => {
+        if (!thinkChars) return;
+        emitUi({ t: 'think_end', chars: thinkChars, ms: Date.now() - thinkStart });
+        hooks?.onThinkEnd?.();
+        thinkChars = 0;
+        thinkStart = 0;
+      };
+
+      // 思考正文主路径：模型调用结束时从回调里取完整消息。
+      // 流里那份 reasoning_content 被 LangGraph 冲成 null 了，这里才是能用的通道。
+      callbacks.push(
+        new ReasoningCollector((reasoning, ms) => {
+          // 万一将来 graph 的流又能给真增量了，别把同一段思考发两遍
+          if (thinkChars > 0) return;
+          thinkChars = reasoning.length;
+          thinkStart = Date.now() - ms;
+          emitUi({ t: 'think', d: reasoning });
+          hooks?.onThink?.(reasoning);
+          closeThink();
+        }),
+      );
       try {
         const stream = (await this.graph.app.stream(
           { messages: [new HumanMessage(sentContent)], module: req.module.id },
@@ -948,12 +1035,38 @@ export class HiveAgent {
         )) as AsyncIterable<[BaseMessage, Record<string, unknown>]>;
 
         for await (const [chunk, meta] of stream) {
-          if (meta?.['langgraph_node'] !== 'agent') continue;
+          const node = meta?.['langgraph_node'];
+
+          // 工具节点：ToolMessage。name 就是工具名，右栏拿它画阶段分隔线。
+          // 不去重 —— 同一个工具连调三次就是要看到三条，那才是「它在干什么」。
+          if (node === 'tools') {
+            closeThink();
+            const nm = (chunk as { name?: string }).name;
+            if (nm) {
+              emitUi({ t: 'tool', name: nm });
+              hooks?.onTool?.(nm);
+            }
+            continue;
+          }
+          if (node !== 'agent') continue;
+
+          const think = (chunk.additional_kwargs as { reasoning_content?: unknown } | undefined)?.reasoning_content;
+          if (typeof think === 'string' && think) {
+            if (!thinkChars) thinkStart = Date.now();
+            thinkChars += think.length;
+            emitUi({ t: 'think', d: think });
+            hooks?.onThink?.(think);
+          }
+
           const piece = contentToText(chunk.content);
           if (!piece) continue;
+          closeThink();
           text += piece;
           onChunk?.(piece);
+          // 只有主会话（带 hooks）才往对话流发正文：借调子任务的输出不该混进主对话。
+          if (hooks) emitUi({ t: 'say', d: piece });
         }
+        closeThink();
       } catch (e) {
         if (isBudgetExceeded(e)) {
           return {

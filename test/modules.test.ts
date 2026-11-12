@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { MODULES, getModule, moduleList, fragmentFor, AGENTS } from '../src/core/modules.js';
+import { MODULES, getModule, moduleList, fragmentFor, AGENTS, effectiveThink } from '../src/core/modules.js';
 import {
   ALL_TOOLS,
   TOOL_MAP,
@@ -72,4 +72,25 @@ test('read_file 挡住越界路径', async () => {
   assert.ok(escape.startsWith('ERROR'), `越界应该被挡：${escape}`);
   const missing = String(await rf.invoke({ path: 'definitely-not-here.txt' }));
   assert.ok(missing.startsWith('ERROR'));
+});
+
+test('思考档：隐私窗口里把「关」的身份打开，off 不动，正常终端原样', () => {
+  const assistant = getModule('assistant')!;
+  const calc = getModule('calc')!;
+
+  // 正常终端：一个字节都不改（思考 token 贵）
+  assert.equal(effectiveThink(assistant, false), assistant.think);
+  assert.equal(effectiveThink(calc, false), calc.think);
+
+  // 隐私窗口：用户在窗口里就是要看它在想什么
+  assert.equal(assistant.think, 'low');
+  assert.equal(effectiveThink(assistant, true), 'high');
+
+  // off 是「查表不思考」的刻意选择，窗口里也不该打开
+  assert.equal(calc.think, 'off');
+  assert.equal(effectiveThink(calc, true), 'off');
+
+  // 本来就 high 的身份，窗口内外一致
+  const recon = moduleList().find((m) => m.think === 'high');
+  if (recon) assert.equal(effectiveThink(recon, true), 'high');
 });
